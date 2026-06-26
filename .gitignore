@@ -1,0 +1,51 @@
+# Repository scope for CNN-RL: keep only AllocRL in Git.
+/*
+!/.gitignore
+!/AllocRL/
+!/AllocRL/**
+
+# ── Build output ──────────────────────────────────────
+bin/
+obj/
+
+# ── IDE / Editor ──────────────────────────────────────
+.vs/
+*.user
+*.suo
+*.csproj.user
+
+# ── NuGet ─────────────────────────────────────────────
+packages/
+
+# ── OS generated / Temp ───────────────────────────────
+Thumbs.db
+Desktop.ini
+~$*
+
+# ── Data (선택: 대용량 데이터 제외 시 주석 해제) ──────
+# data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# AllocRL generated artifacts
+AllocRL/output/
+AllocRL/tb_logs/
+AllocRL/runs/
+AllocRL/**/training_log.csv
+AllocRL/**/monitor.csv
+AllocRL/**/events.out.tfevents.*
+AllocRL/**/*.onnx
+AllocRL/**/*.onnx.data
+AllocRL/**/*.zip

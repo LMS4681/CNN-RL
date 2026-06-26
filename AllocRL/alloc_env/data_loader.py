@@ -1,0 +1,273 @@
+"""
+CSV 데이터 로더.
+
+C# DataLoader의 Python 재구현.
+- 작업장 마스터 CSV
+- 지번 CSV
+- 블록 데이터 CSV (기배치 + 미배치)
+"""
+
+from __future__ import annotations
+
+import csv
+from datetime import datetime, date
+from pathlib import Path
+from typing import Dict, IO, List, Mapping, Optional, Sequence, Tuple
+
+from . import calendar as cal
+
+
+def _open_csv(path: str) -> IO:
+    """CSV 파일을 적절한 인코딩으로 엽니다 (utf-8-sig → cp949 fallback)."""
+    for enc in ("utf-8-sig", "cp949", "euc-kr"):
+        try:
+            f = open(path, encoding=enc)
+            f.readline()  # 첫 줄 읽어서 인코딩 검증
+            f.seek(0)
+            return f
+        except (UnicodeDecodeError, UnicodeError):
+            f.close()
+    # 최후 수단: errors=replace
+    return open(path, encoding="utf-8", errors="replace")
+from .block import Block, PrePlacedBlock
+from .workspace import LotRegion, Workspace
+from .strategy import BaseGridStrategy
+
+# ── 블록 CSV 열 인덱스 (0-based) ─────────────────────────────────
+
+COL_SHIP_NO      = 0   # A: 호선
+COL_BLOCK_NAME   = 1   # B: 블록
+COL_WORKSPACE    = 6   # G: 배치 작업장 코드
+COL_COORD        = 8   # I: 블록 좌표값 (x,y)
+COL_LENGTH       = 9   # J: 길이
+COL_BREADTH      = 10  # K: 폭
+COL_HEIGHT       = 11  # L: 높이
+COL_WEIGHT       = 12  # M: 중량
+COL_PLACED_IN    = 15  # P: 기배치 배치일
+COL_PLACED_OUT   = 16  # Q: 기배치 출고일
+COL_SCHEDULE_IN  = 17  # R: 미배치 예정 입고일
+COL_SCHEDULE_OUT = 18  # S: 미배치 예정 출고일
+
+
+# ── 공개 API ─────────────────────────────────────────────────────
+
+def load_workspaces(
+    workspace_csv: str,
+    lot_csv: str,
+    strategy: Optional[BaseGridStrategy] = None,
+) -> List[Workspace]:
+    """작업장 CSV + 지번 CSV → Workspace 목록 생성."""
+    if strategy is None:
+        strategy = BaseGridStrategy()
+
+    ws_master = _parse_workspace_csv(workspace_csv)
+    lots_per_ws = _parse_lot_csv(lot_csv)
+
+    workspaces: List[Workspace] = []
+    for code, (name, width, height) in ws_master.items():
+        ws = Workspace(
+            code=code,
+            origin_x=0.0,
+            origin_y=0.0,
+            breadth=height,
+            length=width,
+            name=name,
+            strategy=strategy,
+        )
+
+        if code in lots_per_ws:
+            for lot_id, csv_x, csv_y, lot_w, lot_h in lots_per_ws[code]:
+                converted_y = height - (csv_y + lot_h)
+                ws.add_lot(LotRegion(
+                    lot_id=lot_id,
+                    origin_x=csv_x,
+                    origin_y=converted_y,
+                    breadth=lot_h,
+                    length=lot_w,
+                ))
+
+        workspaces.append(ws)
+
+    total_lots = sum(len(ws.lots) for ws in workspaces)
+    print(f"[DataLoader] 작업장 {len(workspaces)}개 로드 (지번 총 {total_lots}개)")
+    return workspaces
+
+
+def apply_allowable_block_patterns(
+    workspaces: List[Workspace],
+    patterns_by_workspace: Optional[Mapping[str, Sequence[str]]] = None,
+) -> List[Workspace]:
+    """
+    작업장별 허용 블록명 패턴을 적용합니다.
+
+    패턴 기준 데이터가 없는 현재 학습 CSV에서는 기본적으로 제약을 두지 않습니다.
+    호출자가 매핑을 넘기면 작업장 코드(case-insensitive)를 기준으로 패턴을 주입합니다.
+    """
+    if not patterns_by_workspace:
+        return workspaces
+
+    normalized = {
+        code.upper(): list(patterns)
+        for code, patterns in patterns_by_workspace.items()
+    }
+    for ws in workspaces:
+        ws.set_allowable_block_patterns(normalized.get(ws.code.upper()))
+    return workspaces
+
+
+def load_blocks(
+    block_csv: str,
+    workspaces: List[Workspace],
+) -> List[Block]:
+    """블록 CSV → 미배치 블록 리스트 (기배치는 작업장에 직접 등록)."""
+    ws_map = {ws.code.upper(): ws for ws in workspaces}
+    unplaced: List[Block] = []
+    pre_placed_count = 0
+    skipped = 0
+
+    with _open_csv(block_csv) as f:
+        reader = csv.reader(f)
+        next(reader)  # 헤더 skip
+        for row in reader:
+            if len(row) < 19:
+                continue
+
+            ship_no    = row[COL_SHIP_NO].strip()
+            block_name = row[COL_BLOCK_NAME].strip()
+            ws_code    = row[COL_WORKSPACE].strip()
+            length     = _parse_float(row[COL_LENGTH])
+            breadth    = _parse_float(row[COL_BREADTH])
+            height     = _parse_float(row[COL_HEIGHT])
+            weight     = _parse_float(row[COL_WEIGHT])
+
+            if length <= 0 or breadth <= 0:
+                skipped += 1
+                continue
+
+            # ── 기배치 블록 ───────────────────────────────────────
+            placed_in  = _try_parse_date(row[COL_PLACED_IN])
+            placed_out = _try_parse_date(row[COL_PLACED_OUT])
+
+            if ws_code and placed_in and placed_out:
+                ws = ws_map.get(ws_code.upper())
+                if ws:
+                    csv_x, csv_y = _parse_coord(row[COL_COORD])
+                    center_x = csv_x + length / 2.0
+                    center_y = ws.breadth - (csv_y + breadth / 2.0)
+
+                    pp = PrePlacedBlock(
+                        label=f"{ship_no}-{block_name}",
+                        pos_x=center_x,
+                        pos_y=center_y,
+                        length=length,
+                        breadth=breadth,
+                        start_date=placed_in,
+                        end_date=placed_out,
+                    )
+                    ws.add_pre_placement(pp)
+                    pre_placed_count += 1
+                continue
+
+            # ── 미배치 블록 ───────────────────────────────────────
+            sched_in  = _try_parse_date(row[COL_SCHEDULE_IN])
+            sched_out = _try_parse_date(row[COL_SCHEDULE_OUT])
+
+            if sched_in and sched_out:
+                sched_in = cal.adjust_to_working_day(sched_in, forward=True)
+                sched_out = cal.adjust_to_working_day(sched_out, forward=True)
+
+                block = Block(
+                    name=block_name,
+                    ship_no=ship_no,
+                    block_type="BUILD",
+                    length=length,
+                    breadth=breadth,
+                    height=height,
+                    weight=weight,
+                    in_date=sched_in,
+                    out_date=sched_out,
+                )
+                unplaced.append(block)
+                continue
+
+            skipped += 1
+
+    print(f"[DataLoader] 기배치 {pre_placed_count}개, "
+          f"미배치 {len(unplaced)}개, 스킵 {skipped}개")
+    return unplaced
+
+
+# ── 내부 파서 ─────────────────────────────────────────────────────
+
+def _parse_workspace_csv(
+    path: str,
+) -> Dict[str, Tuple[str, float, float]]:
+    """작업장 마스터 CSV → {code: (name, width, height)}"""
+    result: Dict[str, Tuple[str, float, float]] = {}
+    with _open_csv(path) as f:
+        reader = csv.reader(f)
+        next(reader)  # 헤더 skip
+        for row in reader:
+            if len(row) < 6:
+                continue
+            code   = row[2].strip()
+            name   = row[3].strip()
+            width  = _parse_float(row[4])
+            height = _parse_float(row[5])
+            if code and width > 0 and height > 0:
+                result[code] = (name, width, height)
+    return result
+
+
+def _parse_lot_csv(
+    path: str,
+) -> Dict[str, List[Tuple[str, float, float, float, float]]]:
+    """지번 CSV → {ws_code: [(lot_id, x, y, width, height), ...]}"""
+    result: Dict[str, List[Tuple[str, float, float, float, float]]] = {}
+    with _open_csv(path) as f:
+        reader = csv.reader(f)
+        next(reader)  # 헤더 skip
+        for row in reader:
+            if len(row) < 6:
+                continue
+            ws_code = row[0].strip()
+            lot_id  = row[1].strip()
+            x       = _parse_float(row[2])
+            y       = _parse_float(row[3])
+            width   = _parse_float(row[4])
+            height  = _parse_float(row[5])
+            if not ws_code:
+                continue
+            result.setdefault(ws_code, []).append((lot_id, x, y, width, height))
+    return result
+
+
+# ── 유틸리티 ─────────────────────────────────────────────────────
+
+def _parse_float(value: str) -> float:
+    try:
+        return float(value.strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _try_parse_date(value: str) -> Optional[date]:
+    value = value.strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_coord(value: str) -> Tuple[float, float]:
+    value = value.strip()
+    if not value:
+        return 0.0, 0.0
+    parts = value.split(",")
+    if len(parts) >= 2:
+        return _parse_float(parts[0]), _parse_float(parts[1])
+    return 0.0, 0.0
