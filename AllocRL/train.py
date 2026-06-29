@@ -124,18 +124,29 @@ def train(args):
             "cnn_out_dim": 64,
         },
     }
-    model = MaskablePPO(
-        "MultiInputPolicy",
-        env,
-        verbose=1,
-        learning_rate=args.lr,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=str(output_dir / "tb_logs"),
-    )
+    if args.resume_from:
+        resume_path = Path(args.resume_from).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume model not found: {resume_path}")
+        print(f"기존 모델에서 이어 학습: {resume_path}")
+        model = MaskablePPO.load(
+            str(resume_path),
+            env=env,
+            tensorboard_log=str(output_dir / "tb_logs"),
+        )
+    else:
+        model = MaskablePPO(
+            "MultiInputPolicy",
+            env,
+            verbose=1,
+            learning_rate=args.lr,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=str(output_dir / "tb_logs"),
+        )
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = AllocationCallback(log_dir=args.output_dir, verbose=1)
@@ -147,6 +158,7 @@ def train(args):
         total_timesteps=args.timesteps,
         progress_bar=True,
         callback=callback,
+        reset_num_timesteps=not bool(args.resume_from),
     )
 
     # ── 7. 모델 저장 ─────────────────────────────────────────────
@@ -289,6 +301,8 @@ def main():
                         help="감가율 (discount factor)")
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="이어 학습할 기존 SB3 모델 zip 경로")
     parser.add_argument("--export-onnx", action="store_true", default=True,
                         help="ONNX export 수행")
     parser.add_argument("--no-export-onnx", action="store_false", dest="export_onnx")
