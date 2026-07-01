@@ -28,6 +28,44 @@ def mask_fn(env):
     return env.action_masks()
 
 
+def build_policy_kwargs(
+    extractor: str = "cnn",
+    features_dim: int = 256,
+    cnn_out_dim: int = 64,
+    embed_dim: int = 64,
+    num_heads: int = 4,
+):
+    from alloc_env.cnn_extractor import (
+        OccupancyCnnExtractor,
+        PointerAttentionCnnExtractor,
+    )
+
+    extractors = {
+        "cnn": OccupancyCnnExtractor,
+        "pointer-attn": PointerAttentionCnnExtractor,
+    }
+    if extractor not in extractors:
+        raise ValueError(
+            f"Unknown extractor '{extractor}'. "
+            f"Choose one of: {', '.join(extractors)}"
+        )
+
+    extractor_kwargs = {
+        "features_dim": features_dim,
+        "cnn_out_dim": cnn_out_dim,
+    }
+    if extractor == "pointer-attn":
+        extractor_kwargs.update({
+            "embed_dim": embed_dim,
+            "num_heads": num_heads,
+        })
+
+    return {
+        "features_extractor_class": extractors[extractor],
+        "features_extractor_kwargs": extractor_kwargs,
+    }
+
+
 def make_env(blocks, workspaces, strategy, use_synthetic=False, generator=None):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
@@ -69,7 +107,6 @@ def train(args):
     from alloc_env.strategy import BaseGridStrategy
     from alloc_env.callbacks import AllocationCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
-    from alloc_env.cnn_extractor import OccupancyCnnExtractor
 
     data_dir = Path(args.data_dir)
     ws_csv   = str(data_dir / "선행건조 작업장 기준정보.csv")
@@ -117,13 +154,14 @@ def train(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 4. 모델 생성 (CNN+MLP 하이브리드) ─────────────────────────
-    policy_kwargs = {
-        "features_extractor_class": OccupancyCnnExtractor,
-        "features_extractor_kwargs": {
-            "features_dim": 256,
-            "cnn_out_dim": 64,
-        },
-    }
+    policy_kwargs = build_policy_kwargs(
+        extractor=args.extractor,
+        features_dim=args.features_dim,
+        cnn_out_dim=args.cnn_out_dim,
+        embed_dim=args.extractor_embed_dim,
+        num_heads=args.extractor_heads,
+    )
+    print(f"Feature extractor: {args.extractor}")
     if args.resume_from:
         resume_path = Path(args.resume_from).resolve()
         if not resume_path.exists():
@@ -301,6 +339,17 @@ def main():
                         help="감가율 (discount factor)")
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
+    parser.add_argument("--extractor", type=str, default="cnn",
+                        choices=["cnn", "pointer-attn"],
+                        help="feature extractor: cnn or pointer-attn")
+    parser.add_argument("--features-dim", type=int, default=256,
+                        help="policy feature vector dimension")
+    parser.add_argument("--cnn-out-dim", type=int, default=64,
+                        help="workspace CNN output dimension")
+    parser.add_argument("--extractor-embed-dim", type=int, default=64,
+                        help="pointer-attn token embedding dimension")
+    parser.add_argument("--extractor-heads", type=int, default=4,
+                        help="pointer-attn attention head count")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="이어 학습할 기존 SB3 모델 zip 경로")
     parser.add_argument("--export-onnx", action="store_true", default=True,

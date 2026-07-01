@@ -18,6 +18,8 @@ SB3 MultiInputPolicy와 호환되는 커스텀 Feature Extractor.
 
 from __future__ import annotations
 
+import math
+
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -174,3 +176,107 @@ class OccupancyCnnExtractor(BaseFeaturesExtractor):
         # 4. Fusion
         combined = torch.cat([block_feat, ws_cnn_feats, ws_meta_flat], dim=1)
         return self.fusion(combined)  # (B, features_dim)
+
+
+class PointerAttentionCnnExtractor(BaseFeaturesExtractor):
+    """
+    CNN workspace encoder with workspace self-attention and pointer-style scores.
+
+    The observation contract is unchanged:
+      - block: current block features
+      - grids: workspace occupancy grids
+      - ws_meta: workspace metadata
+
+    This extractor keeps one token per workspace, lets workspaces attend to each
+    other, then scores each workspace token against the current block embedding.
+    The final vector is still a standard SB3 feature vector, so MaskablePPO and
+    action masking continue to work without a custom policy class.
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        features_dim: int = 256,
+        cnn_out_dim: int = 64,
+        embed_dim: int = 64,
+        num_heads: int = 4,
+    ):
+        super().__init__(observation_space, features_dim)
+
+        block_dim = observation_space["block"].shape[0]
+        n_workspaces = observation_space["grids"].shape[0]
+        ws_meta_dim = observation_space["ws_meta"].shape[1]
+
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
+        self._n_workspaces = n_workspaces
+        self._embed_dim = embed_dim
+
+        self.block_encoder = nn.Sequential(
+            nn.Linear(block_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.shared_cnn = SharedCNN(
+            in_channels=3,
+            cnn_out_dim=cnn_out_dim,
+        )
+        self.workspace_encoder = nn.Sequential(
+            nn.Linear(cnn_out_dim + ws_meta_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.workspace_attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(embed_dim)
+        self.key_layer = nn.Linear(embed_dim, embed_dim)
+        self.context_layer = nn.Sequential(
+            nn.Linear(embed_dim * 3 + n_workspaces, features_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, observations: dict) -> torch.Tensor:
+        batch_size = observations["block"].shape[0]
+        grids = observations["grids"]
+        ws_meta = observations["ws_meta"]
+        n_workspaces = self._n_workspaces
+
+        block_query = self.block_encoder(observations["block"])
+
+        grids_flat = grids.reshape(
+            batch_size * n_workspaces,
+            3,
+            grids.shape[3],
+            grids.shape[4],
+        )
+        cnn_out = self.shared_cnn(grids_flat)
+        cnn_tokens = cnn_out.reshape(batch_size, n_workspaces, -1)
+        workspace_tokens = self.workspace_encoder(
+            torch.cat([cnn_tokens, ws_meta], dim=-1)
+        )
+
+        attended, _ = self.workspace_attention(
+            workspace_tokens,
+            workspace_tokens,
+            workspace_tokens,
+            need_weights=False,
+        )
+        workspace_tokens = self.attention_norm(workspace_tokens + attended)
+
+        keys = self.key_layer(workspace_tokens)
+        pointer_scores = (
+            keys * block_query.unsqueeze(1)
+        ).sum(dim=-1) / math.sqrt(self._embed_dim)
+        pointer_weights = torch.softmax(pointer_scores, dim=1).unsqueeze(-1)
+        pointer_context = (workspace_tokens * pointer_weights).sum(dim=1)
+        pooled_context = workspace_tokens.mean(dim=1)
+
+        combined = torch.cat(
+            [block_query, pointer_context, pooled_context, pointer_scores],
+            dim=1,
+        )
+        return self.context_layer(combined)
