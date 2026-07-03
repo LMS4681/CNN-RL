@@ -20,7 +20,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 
-from alloc_env.block import Block, PrePlacedBlock
+from alloc_env.block import Block, PrePlacedBlock, SAFETY_DISTANCE
 from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import Workspace
 
@@ -47,11 +47,18 @@ def _preplaced_bounds(pp: PrePlacedBlock) -> tuple[float, float, float, float]:
 def _rects_overlap(
     a: tuple[float, float, float, float],
     b: tuple[float, float, float, float],
+    safety_distance: float = 0.0,
 ) -> bool:
     a_left, a_right, a_bottom, a_top = a
     b_left, b_right, b_bottom, b_top = b
-    sep_x = a_right <= b_left + EPSILON or b_right <= a_left + EPSILON
-    sep_y = a_top <= b_bottom + EPSILON or b_top <= a_bottom + EPSILON
+    sep_x = (
+        a_right + safety_distance <= b_left + EPSILON
+        or b_right + safety_distance <= a_left + EPSILON
+    )
+    sep_y = (
+        a_top + safety_distance <= b_bottom + EPSILON
+        or b_top + safety_distance <= a_bottom + EPSILON
+    )
     return not (sep_x or sep_y)
 
 
@@ -60,7 +67,7 @@ def _periods_overlap(a_start: date, a_end: date, b_start: date, b_end: date) -> 
 
 
 def _block_periods_overlap(a_start: date, a_end: date, b_start: date, b_end: date) -> bool:
-    return a_start < b_end and b_start < a_end
+    return a_start <= b_end and b_start <= a_end
 
 
 def _block_preplaced_periods_overlap(
@@ -69,11 +76,11 @@ def _block_preplaced_periods_overlap(
     preplaced_start: date,
     preplaced_end: date,
 ) -> bool:
-    return block_start <= preplaced_end and preplaced_start < block_end
+    return block_start <= preplaced_end and preplaced_start <= block_end
 
 
 def _is_active(block: Block, env_date: date) -> bool:
-    return block.in_date <= env_date < block.out_date
+    return block.in_date <= env_date <= block.out_date
 
 
 def _is_preplaced_active(pp: PrePlacedBlock, env_date: date) -> bool:
@@ -149,13 +156,23 @@ def find_placement_violations(result: SimulationResult) -> list[dict[str, str]]:
                 pp.end_date,
             ):
                 continue
-            if _rects_overlap(_block_bounds(block), _preplaced_bounds(pp)):
+            block_bounds = _block_bounds(block)
+            preplaced_bounds = _preplaced_bounds(pp)
+            if _rects_overlap(block_bounds, preplaced_bounds):
                 violations.append({
                     "type": "preplaced_overlap",
                     "block_index": str(idx),
                     "block_name": block.name,
                     "workspace_code": block.workspace_code,
                     "detail": f"overlaps preplaced block {pp.label}",
+                })
+            elif _rects_overlap(block_bounds, preplaced_bounds, SAFETY_DISTANCE):
+                violations.append({
+                    "type": "preplaced_safety_distance",
+                    "block_index": str(idx),
+                    "block_name": block.name,
+                    "workspace_code": block.workspace_code,
+                    "detail": f"closer than {SAFETY_DISTANCE:.1f}m to preplaced block {pp.label}",
                 })
 
         placed_blocks.append((idx, block))
@@ -166,13 +183,23 @@ def find_placement_violations(result: SimulationResult) -> list[dict[str, str]]:
                 continue
             if not _block_periods_overlap(left.in_date, left.out_date, right.in_date, right.out_date):
                 continue
-            if _rects_overlap(_block_bounds(left), _block_bounds(right)):
+            left_bounds = _block_bounds(left)
+            right_bounds = _block_bounds(right)
+            if _rects_overlap(left_bounds, right_bounds):
                 violations.append({
                     "type": "overlap",
                     "block_index": str(i),
                     "block_name": left.name,
                     "workspace_code": left.workspace_code or "",
                     "detail": f"overlaps block {j}:{right.name}",
+                })
+            elif _rects_overlap(left_bounds, right_bounds, SAFETY_DISTANCE):
+                violations.append({
+                    "type": "safety_distance",
+                    "block_index": str(i),
+                    "block_name": left.name,
+                    "workspace_code": left.workspace_code or "",
+                    "detail": f"closer than {SAFETY_DISTANCE:.1f}m to block {j}:{right.name}",
                 })
 
     return violations

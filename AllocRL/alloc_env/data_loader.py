@@ -33,6 +33,9 @@ from .block import Block, PrePlacedBlock
 from .workspace import LotRegion, Workspace
 from .strategy import BaseGridStrategy
 
+DEFAULT_WORKSPACE_LIMIT = 7
+DEFAULT_TARGET_NAME_PREFIX = "target"
+
 # ── 블록 CSV 열 인덱스 (0-based) ─────────────────────────────────
 
 COL_SHIP_NO      = 0   # A: 호선
@@ -55,23 +58,31 @@ def load_workspaces(
     workspace_csv: str,
     lot_csv: str,
     strategy: Optional[BaseGridStrategy] = None,
+    workspace_limit: Optional[int] = DEFAULT_WORKSPACE_LIMIT,
+    target_name_prefix: Optional[str] = DEFAULT_TARGET_NAME_PREFIX,
 ) -> List[Workspace]:
     """작업장 CSV + 지번 CSV → Workspace 목록 생성."""
     if strategy is None:
         strategy = BaseGridStrategy()
+    if workspace_limit is not None and workspace_limit < 1:
+        raise ValueError("workspace_limit must be at least 1")
 
     ws_master = _parse_workspace_csv(workspace_csv)
     lots_per_ws = _parse_lot_csv(lot_csv)
+    workspace_items = list(ws_master.items())
+    if workspace_limit is not None:
+        workspace_items = workspace_items[:workspace_limit]
 
     workspaces: List[Workspace] = []
-    for code, (name, width, height) in ws_master.items():
+    for idx, (code, (name, width, height)) in enumerate(workspace_items, start=1):
+        display_name = f"{target_name_prefix}{idx}" if target_name_prefix else name
         ws = Workspace(
             code=code,
             origin_x=0.0,
             origin_y=0.0,
             breadth=height,
             length=width,
-            name=name,
+            name=display_name,
             strategy=strategy,
         )
 

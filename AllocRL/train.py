@@ -34,7 +34,7 @@ def build_policy_kwargs(
     cnn_out_dim: int = 64,
     embed_dim: int = 64,
     num_heads: int = 4,
-):
+) -> dict:
     from alloc_env.cnn_extractor import (
         OccupancyCnnExtractor,
         PointerAttentionCnnExtractor,

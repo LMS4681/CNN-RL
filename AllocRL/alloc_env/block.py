@@ -19,6 +19,7 @@ from . import calendar as cal
 
 # C# AllocConst.Epsilon 대응
 EPSILON = 1e-5
+SAFETY_DISTANCE = 1.0
 
 
 @dataclass
@@ -50,8 +51,14 @@ class PrePlacedBlock:
         b_bottom = block.ref_y - block.breadth / 2
         b_top    = block.ref_y + block.breadth / 2
 
-        sep_x = a_right <= b_left + EPSILON or b_right <= a_left + EPSILON
-        sep_y = a_top   <= b_bottom + EPSILON or b_top  <= a_bottom + EPSILON
+        sep_x = (
+            a_right + SAFETY_DISTANCE <= b_left + EPSILON
+            or b_right + SAFETY_DISTANCE <= a_left + EPSILON
+        )
+        sep_y = (
+            a_top + SAFETY_DISTANCE <= b_bottom + EPSILON
+            or b_top + SAFETY_DISTANCE <= a_bottom + EPSILON
+        )
 
         return not (sep_x or sep_y)
 
@@ -109,8 +116,14 @@ class Block:
         b_bottom = other.ref_y - other.breadth / 2
         b_top    = other.ref_y + other.breadth / 2
 
-        sep_x = a_right <= b_left + EPSILON or b_right <= a_left + EPSILON
-        sep_y = a_top   <= b_bottom + EPSILON or b_top  <= a_bottom + EPSILON
+        sep_x = (
+            a_right + SAFETY_DISTANCE <= b_left + EPSILON
+            or b_right + SAFETY_DISTANCE <= a_left + EPSILON
+        )
+        sep_y = (
+            a_top + SAFETY_DISTANCE <= b_bottom + EPSILON
+            or b_top + SAFETY_DISTANCE <= a_bottom + EPSILON
+        )
 
         return not (sep_x or sep_y)
 

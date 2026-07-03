@@ -120,7 +120,7 @@ class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
         self.assertIn("out_of_bounds", violation_types)
         self.assertIn("dropout", violation_types)
 
-    def test_find_placement_violations_allows_back_to_back_same_position(self):
+    def test_find_placement_violations_flags_same_day_same_position(self):
         workspace = make_workspace()
         first = make_block("A001", "PE001", ref_x=5.0, ref_y=5.0)
         first.out_date = date(2026, 1, 10)
@@ -135,7 +135,7 @@ class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
 
         violations = find_placement_violations(result)
 
-        self.assertNotIn("overlap", {item["type"] for item in violations})
+        self.assertIn("overlap", {item["type"] for item in violations})
 
     def test_export_evaluation_visualization_writes_assignments_violations_and_frames(self):
         workspace = make_workspace()

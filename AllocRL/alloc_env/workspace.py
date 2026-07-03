@@ -115,8 +115,8 @@ class Workspace:
             return False
 
     def clear_outgoing_blocks(self, env_date: date) -> None:
-        """출고일 ≤ env_date인 블록을 제거하여 공간 해제."""
-        self.blocks = [b for b in self.blocks if b.out_date > env_date]
+        """출고일이 env_date보다 빠른 블록만 제거하여 공간 해제."""
+        self.blocks = [b for b in self.blocks if b.out_date >= env_date]
 
     # ── 배치 좌표 결정 (전략 위임) ────────────────────────────────
 
