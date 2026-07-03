@@ -33,8 +33,8 @@ from .block import Block, PrePlacedBlock
 from .workspace import LotRegion, Workspace
 from .strategy import BaseGridStrategy
 
-DEFAULT_WORKSPACE_LIMIT = 7
-DEFAULT_TARGET_NAME_PREFIX = "target"
+DEFAULT_WORKSPACE_LIMIT = None
+DEFAULT_TARGET_NAME_PREFIX = None
 
 # ── 블록 CSV 열 인덱스 (0-based) ─────────────────────────────────
 

@@ -159,21 +159,21 @@ class SafetyAndWorkspaceLimitTests(unittest.TestCase):
 
         self.assertIn("overlap", {item["type"] for item in violations})
 
-    def test_visualization_prefers_target_workspace_name_over_code(self):
+    def test_visualization_prefers_csv_workspace_name_over_code(self):
         workspace = Workspace(
             code="PE001",
             origin_x=0.0,
             origin_y=0.0,
             breadth=100.0,
             length=100.0,
-            name="target1",
+            name="Original-1",
             strategy=BaseGridStrategy(step=10.0),
         )
         module = _load_visualize_eval_without_matplotlib()
 
-        self.assertEqual("target1", module._workspace_display_name(workspace))
+        self.assertEqual("Original-1", module._workspace_display_name(workspace))
 
-    def test_load_workspaces_limits_to_seven_and_renames_targets(self):
+    def test_load_workspaces_preserves_csv_workspaces_and_names_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             workspace_csv = tmp / "workspaces.csv"
@@ -203,9 +203,9 @@ class SafetyAndWorkspaceLimitTests(unittest.TestCase):
                 BaseGridStrategy(step=10.0),
             )
 
-        self.assertEqual(7, len(workspaces))
+        self.assertEqual(9, len(workspaces))
         self.assertEqual(
-            [f"target{i}" for i in range(1, 8)],
+            [f"Original-{i}" for i in range(1, 10)],
             [ws.name for ws in workspaces],
         )
         self.assertEqual("PE001", workspaces[0].code)
