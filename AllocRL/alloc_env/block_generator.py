@@ -141,7 +141,7 @@ class SyntheticBlockGenerator:
         self,
         n_blocks: int,
         base_date: date,
-        spread_days: int = 60,
+        spread_days: int | Tuple[int, int] = 90,
     ) -> List[Block]:
         """
         n_blocks개의 가상 미배치 블록 생성.
@@ -149,9 +149,22 @@ class SyntheticBlockGenerator:
         Args:
             n_blocks: 생성할 블록 수
             base_date: 기준 날짜 (입고일 시작점)
-            spread_days: 입고일 분산 범위 (달력일)
+            spread_days: 입고일 분산 범위. 정수이면 고정 폭, 튜플이면
+                        (min, max) 범위에서 에피소드별 샘플링.
+                        기본값 90은 기존 30~90일 랜덤 동작을 유지.
         """
         dist = self._dist
+
+        if isinstance(spread_days, tuple):
+            spread_min, spread_max = spread_days
+            spread_min = max(0, int(spread_min))
+            spread_max = max(spread_min, int(spread_max))
+            actual_spread = int(self._rng.integers(spread_min, spread_max + 1))
+        else:
+            # Historical default: no explicit override means 30-90 day random.
+            actual_spread = int(self._rng.integers(30, 91))
+            if spread_days != 90:
+                actual_spread = max(0, int(spread_days))
 
         # 속성 일괄 샘플링 (벡터 연산)
         lens = dist.length.sample(self._rng, n_blocks)
@@ -161,8 +174,8 @@ class SyntheticBlockGenerator:
         durs = dist.duration_days.sample(self._rng, n_blocks).astype(int)
         durs = np.maximum(durs, 2)  # 최소 2일
 
-        # 입고일: base_date ~ base_date + spread_days 범위 내 랜덤
-        day_offsets = self._rng.integers(0, spread_days + 1, size=n_blocks)
+        # 입고일: base_date ~ base_date + actual_spread 범위 내 랜덤
+        day_offsets = self._rng.integers(0, actual_spread + 1, size=n_blocks)
         # 정렬: 입고일 순으로 정렬 (시뮬레이터 효율)
         day_offsets.sort()
 

@@ -25,6 +25,14 @@ from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import Workspace
 
 EPSILON = 1e-5
+DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
+
+
+def parse_workspace_codes(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    codes = [code.strip().upper() for code in value.split(",") if code.strip()]
+    return codes or None
 
 
 def _rect_bounds(cx: float, cy: float, length: float, breadth: float) -> tuple[float, float, float, float]:
@@ -247,8 +255,20 @@ def _write_violations(violations: list[dict[str, str]], output_dir: Path) -> Non
             writer.writerow(item)
 
 
-def _plot_workspace_frame(result: SimulationResult, env_date: date, save_path: Path) -> None:
-    workspaces = result.workspaces
+def _plot_workspace_frame(
+    result: SimulationResult,
+    env_date: date,
+    save_path: Path,
+    active_workspace_codes: list[str] | None = None,
+) -> None:
+    active_codes = (
+        {code.upper() for code in active_workspace_codes}
+        if active_workspace_codes else None
+    )
+    workspaces = [
+        ws for ws in result.workspaces
+        if active_codes is None or ws.code.upper() in active_codes
+    ]
     if not workspaces:
         return
 
@@ -339,6 +359,7 @@ def export_evaluation_visualization(
     assignments: list[int] | None,
     output_dir: str | Path,
     frame_stride_days: int = 1,
+    active_workspace_codes: list[str] | None = None,
 ) -> list[dict[str, str]]:
     output_dir = Path(output_dir)
     frames_dir = output_dir / "placement_frames"
@@ -364,6 +385,7 @@ def export_evaluation_visualization(
             result,
             env_date,
             frames_dir / f"placement_{env_date.isoformat()}.png",
+            active_workspace_codes=active_workspace_codes,
         )
     return violations
 
@@ -374,6 +396,7 @@ def evaluate_model_and_export(
     output_dir: str | Path,
     grid_size: int = 64,
     frame_stride_days: int = 1,
+    active_workspace_codes: str | list[str] | None = DEFAULT_ACTIVE_WORKSPACE_CODES,
 ) -> list[dict[str, str]]:
     from sb3_contrib import MaskablePPO
 
@@ -390,8 +413,19 @@ def evaluate_model_and_export(
     )
     apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(str(data_dir / "블록데이터.csv"), workspaces)
+    active_codes = (
+        parse_workspace_codes(active_workspace_codes)
+        if isinstance(active_workspace_codes, str)
+        else active_workspace_codes
+    )
 
-    env = create_evaluation_env(blocks, workspaces, strategy, grid_size=grid_size)
+    env = create_evaluation_env(
+        blocks,
+        workspaces,
+        strategy,
+        grid_size=grid_size,
+        active_workspace_codes=active_codes,
+    )
     model = MaskablePPO.load(str(model_path), env=env, device="auto")
 
     obs, _ = env.reset()
@@ -412,6 +446,7 @@ def evaluate_model_and_export(
         assignments,
         output_dir,
         frame_stride_days=frame_stride_days,
+        active_workspace_codes=active_codes,
     )
 
 
@@ -422,6 +457,14 @@ def main() -> None:
     parser.add_argument("--output-dir", default="./output/eval_visualization")
     parser.add_argument("--grid-size", type=int, default=64)
     parser.add_argument("--frame-stride-days", type=int, default=1)
+    parser.add_argument(
+        "--active-workspace-codes",
+        default=DEFAULT_ACTIVE_WORKSPACE_CODES,
+        help=(
+            "comma-separated active workspace codes. Evaluation action masks "
+            "and placement frames use this subset; use empty string for all."
+        ),
+    )
     args = parser.parse_args()
 
     violations = evaluate_model_and_export(
@@ -430,6 +473,7 @@ def main() -> None:
         args.output_dir,
         grid_size=args.grid_size,
         frame_stride_days=args.frame_stride_days,
+        active_workspace_codes=args.active_workspace_codes,
     )
     print(f"Visualization files saved to: {Path(args.output_dir).resolve()}")
     print(f"Violation count: {len(violations)}")

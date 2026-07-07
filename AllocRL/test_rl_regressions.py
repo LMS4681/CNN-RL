@@ -7,6 +7,7 @@ import numpy as np
 import alloc_env.alloc_env as alloc_env_module
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
+from alloc_env.block_generator import SyntheticBlockGenerator
 from alloc_env.data_loader import apply_allowable_block_patterns
 from alloc_env.constraints import (
     BlockPatternConstraint,
@@ -198,6 +199,82 @@ class RlRegressionTests(unittest.TestCase):
         self.assertTrue(bool(((placeable == 0.0) | (placeable == 1.0)).all()))
         # 빈 100x100 작업장에 10x10 블록은 즉시 배치 가능 → 1.
         self.assertEqual(obs["ws_meta"][0, 2], 1.0)
+
+    def test_synthetic_env_uses_csv_like_spread_range(self):
+        blocks = [
+            make_block("A001", date(2026, 1, 5)),
+            make_block("A002", date(2026, 7, 3)),
+        ]
+        generator = SyntheticBlockGenerator.from_defaults(seed=0)
+        original_generate = generator.generate
+        captured = {}
+
+        def capture_generate(n_blocks, base_date, spread_days=90):
+            captured["spread_days"] = spread_days
+            return original_generate(n_blocks, base_date, spread_days=spread_days)
+
+        generator.generate = capture_generate
+
+        env = BlockPlacementEnv(
+            blocks,
+            [make_workspace()],
+            BaseGridStrategy(step=10.0),
+            use_synthetic=True,
+            generator=generator,
+            synthetic_n_blocks=len(blocks),
+            grid_size=32,
+        )
+        env.reset()
+
+        csv_spread = (blocks[1].in_date - blocks[0].in_date).days
+        expected = (
+            max(30, int(round(csv_spread * 0.5))),
+            max(30, int(round(csv_spread * 1.2))),
+        )
+        self.assertEqual(expected, captured["spread_days"])
+        self.assertEqual(expected[1], env._date_spread)
+
+    def test_active_workspace_mask_limits_actions_without_changing_shape(self):
+        ws_a = make_workspace()
+        ws_b = make_workspace()
+        ws_b.code = "PE002"
+        env = BlockPlacementEnv(
+            [make_block("A001", date(2026, 1, 5))],
+            [ws_a, ws_b],
+            BaseGridStrategy(step=10.0),
+            active_workspace_codes=["PE001"],
+            grid_size=32,
+        )
+
+        obs, _ = env.reset()
+
+        self.assertEqual((2, 3, 32, 32), obs["grids"].shape)
+        self.assertEqual((2, 3), obs["ws_meta"].shape)
+        self.assertEqual([True, False], env.action_masks().tolist())
+        self.assertGreater(float(obs["grids"][0].sum()), 0.0)
+        self.assertEqual(float(obs["grids"][1].sum()), 0.0)
+        np.testing.assert_array_equal(obs["ws_meta"][1], np.zeros(3, dtype=np.float32))
+
+    def test_blocks_without_active_valid_workspace_are_not_presented(self):
+        small = make_sized_workspace(10.0, 10.0)
+        large = make_sized_workspace(100.0, 100.0)
+        large.code = "PE002"
+        blocks = [
+            make_sized_block("TOO_BIG", date(2026, 1, 5), date(2026, 1, 20), 20.0, 20.0),
+            make_sized_block("OK", date(2026, 1, 6), date(2026, 1, 20), 5.0, 5.0),
+        ]
+        env = BlockPlacementEnv(
+            blocks,
+            [small, large],
+            BaseGridStrategy(step=5.0),
+            active_workspace_codes=["PE001"],
+            grid_size=32,
+        )
+
+        env.reset()
+
+        self.assertEqual(1, env._current_block_index)
+        self.assertEqual([True, False], env.action_masks().tolist())
 
     def test_step_updates_simulator_workspace_and_cnn_grid(self):
         blocks = [

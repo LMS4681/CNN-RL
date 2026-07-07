@@ -46,6 +46,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             captured["device"] = args.device
             captured["n_envs"] = args.n_envs
             captured["vec_env"] = args.vec_env
+            captured["active_workspace_codes"] = args.active_workspace_codes
 
         argv = [
             "train.py",
@@ -55,6 +56,8 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             "4",
             "--vec-env",
             "subproc",
+            "--active-workspace-codes",
+            "PE001,PE002",
             "--no-export-onnx",
         ]
 
@@ -64,6 +67,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         self.assertEqual("cuda", captured["device"])
         self.assertEqual(4, captured["n_envs"])
         self.assertEqual("subproc", captured["vec_env"])
+        self.assertEqual("PE001,PE002", captured["active_workspace_codes"])
 
     def test_auto_vec_env_selection_is_platform_aware(self):
         with patch.object(train_module.sys, "platform", "win32"):

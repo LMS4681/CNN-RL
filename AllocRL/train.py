@@ -24,6 +24,16 @@ if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
 import numpy as np
 
 
+DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
+
+
+def parse_workspace_codes(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    codes = [code.strip().upper() for code in value.split(",") if code.strip()]
+    return codes or None
+
+
 def mask_fn(env):
     return env.action_masks()
 
@@ -97,6 +107,7 @@ def make_env(
     synthetic_n_blocks=None,
     vary_layout=True,
     grid_size=64,
+    active_workspace_codes=None,
 ):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
@@ -107,6 +118,7 @@ def make_env(
             use_synthetic=use_synthetic,
             generator=generator,
             synthetic_n_blocks=synthetic_n_blocks,
+            active_workspace_codes=active_workspace_codes,
             vary_layout=vary_layout,
             grid_size=grid_size,
         )
@@ -121,6 +133,7 @@ def create_training_env(
     grid_size: int = 64,
     n_envs: int = 1,
     vec_env: str = "auto",
+    active_workspace_codes=None,
 ):
     """Create the training env, optionally vectorized for parallel rollout."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -134,6 +147,7 @@ def create_training_env(
         "use_synthetic": True,
         "generator": generator,
         "synthetic_n_blocks": len(blocks),
+        "active_workspace_codes": active_workspace_codes,
         "vary_layout": True,
         "grid_size": grid_size,
     }
@@ -147,7 +161,13 @@ def create_training_env(
     return SubprocVecEnv(env_fns)
 
 
-def create_evaluation_env(blocks, workspaces, strategy, grid_size: int = 64):
+def create_evaluation_env(
+    blocks,
+    workspaces,
+    strategy,
+    grid_size: int = 64,
+    active_workspace_codes=None,
+):
     """CSV 원본 블록으로 평가하는 마스크 적용 환경을 생성합니다."""
     from sb3_contrib.common.wrappers import ActionMasker
 
@@ -158,6 +178,7 @@ def create_evaluation_env(blocks, workspaces, strategy, grid_size: int = 64):
         workspaces,
         strategy,
         use_synthetic=False,
+        active_workspace_codes=active_workspace_codes,
         grid_size=grid_size,
     )
     return ActionMasker(env, mask_fn)
@@ -188,8 +209,16 @@ def train(args):
     workspaces = load_workspaces(ws_csv, lot_csv, strategy)
     apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(blk_csv, workspaces)
+    active_workspace_codes = parse_workspace_codes(args.active_workspace_codes)
 
     print(f"블록 {len(blocks)}개, 작업장 {len(workspaces)}개")
+    if active_workspace_codes:
+        print(
+            f"Active workspaces: {len(active_workspace_codes)}/{len(workspaces)} "
+            f"({', '.join(active_workspace_codes)})"
+        )
+    else:
+        print(f"Active workspaces: all {len(workspaces)}")
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_csv(blk_csv)
@@ -204,6 +233,7 @@ def train(args):
         grid_size=args.grid_size,
         n_envs=args.n_envs,
         vec_env=args.vec_env,
+        active_workspace_codes=active_workspace_codes,
     )
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
@@ -293,7 +323,11 @@ def train(args):
     print("  학습 완료 - 최종 평가")
     print("=" * 60)
     eval_env = create_evaluation_env(
-        blocks, workspaces, strategy, grid_size=args.grid_size
+        blocks,
+        workspaces,
+        strategy,
+        grid_size=args.grid_size,
+        active_workspace_codes=active_workspace_codes,
     )
     evaluate(model, eval_env, n_eval=args.n_eval)
 
@@ -436,6 +470,14 @@ def main():
     parser.add_argument("--vec-env", type=str, default="auto",
                         choices=["auto", "dummy", "subproc"],
                         help="vector env backend when --n-envs > 1")
+    parser.add_argument("--active-workspace-codes", type=str,
+                        default=DEFAULT_ACTIVE_WORKSPACE_CODES,
+                        help=(
+                            "comma-separated active workspace codes. "
+                            "Observation/action shape keeps all workspaces; "
+                            "inactive workspaces are masked. Use empty string "
+                            "to enable all workspaces."
+                        ))
     parser.add_argument("--resume-from", type=str, default=None,
                         help="이어 학습할 기존 SB3 모델 zip 경로")
     parser.add_argument("--export-onnx", action="store_true", default=True,

@@ -52,9 +52,12 @@ SHAPING_PLACEMENT_FAILURE = -0.002
 PARTIAL_REPLAY_WEIGHT = 0.1
 PARTIAL_REPLAY_INTERVAL = 8
 
-# 입고 긴급도 정규화 기준. SyntheticBlockGenerator.generate(spread_days=)의
-# 기본값과 일치시켜야 관측 semantics가 일관됩니다.
-DEFAULT_SYNTHETIC_SPREAD_DAYS = 60
+# 원본 착수일 폭이 없을 때 쓰는 synthetic 날짜 분산 fallback.
+# 실제 학습 synthetic은 원본 블록 착수일 폭의 0.5~1.2배 범위를 사용합니다.
+DEFAULT_SYNTHETIC_SPREAD_DAYS = 90
+MIN_SYNTHETIC_SPREAD_DAYS = 30
+SYNTHETIC_SPREAD_MIN_RATIO = 0.5
+SYNTHETIC_SPREAD_MAX_RATIO = 1.2
 
 
 class BlockPlacementEnv(gym.Env):
@@ -91,6 +94,7 @@ class BlockPlacementEnv(gym.Env):
         synthetic_n_blocks: Optional[int] = None,
         synthetic_base_date: Optional[date] = None,
         synthetic_n_preplaced: int = 0,
+        active_workspace_codes: Optional[List[str]] = None,
         vary_layout: bool = True,
         grid_size: int = GRID_SIZE,
     ):
@@ -107,6 +111,7 @@ class BlockPlacementEnv(gym.Env):
         self._synthetic_base_date = synthetic_base_date or (
             min(b.in_date for b in blocks) if blocks else date(2026, 4, 1)
         )
+        self._synthetic_spread_range = self._compute_synthetic_spread_range(blocks)
         self._synthetic_n_preplaced = synthetic_n_preplaced
         self._vary_layout = vary_layout and use_synthetic
 
@@ -115,6 +120,28 @@ class BlockPlacementEnv(gym.Env):
         self._num_blocks = len(blocks)
         self._num_workspaces = len(workspaces)
         self._workspaces = workspaces
+        self._active_workspace_codes = (
+            {code.strip().upper() for code in active_workspace_codes if code.strip()}
+            if active_workspace_codes else None
+        )
+        if self._active_workspace_codes:
+            workspace_codes = {ws.code.upper() for ws in workspaces}
+            unknown_codes = sorted(self._active_workspace_codes - workspace_codes)
+            if unknown_codes:
+                raise ValueError(
+                    "Unknown active workspace code(s): "
+                    + ", ".join(unknown_codes)
+                )
+            self._active_workspace_mask = np.array(
+                [ws.code.upper() in self._active_workspace_codes for ws in workspaces],
+                dtype=bool,
+            )
+            if not self._active_workspace_mask.any():
+                raise ValueError("At least one active workspace is required.")
+        else:
+            self._active_workspace_mask = np.ones(
+                self._num_workspaces, dtype=bool
+            )
 
         # 전략 주입 (원본에)
         for ws in self._original_workspaces:
@@ -174,6 +201,37 @@ class BlockPlacementEnv(gym.Env):
 
     # ── 정규화 상수 갱신 ──────────────────────────────────────────
 
+    @staticmethod
+    def _compute_synthetic_spread_range(
+        blocks: List[Block],
+    ) -> Tuple[int, int]:
+        if not blocks:
+            return (MIN_SYNTHETIC_SPREAD_DAYS, DEFAULT_SYNTHETIC_SPREAD_DAYS)
+
+        min_in = min(b.in_date for b in blocks)
+        max_in = max(b.in_date for b in blocks)
+        reference_spread = max((max_in - min_in).days, 1)
+        spread_min = max(
+            MIN_SYNTHETIC_SPREAD_DAYS,
+            int(round(reference_spread * SYNTHETIC_SPREAD_MIN_RATIO)),
+        )
+        spread_max = max(
+            spread_min,
+            int(round(reference_spread * SYNTHETIC_SPREAD_MAX_RATIO)),
+        )
+        return (spread_min, spread_max)
+
+    def _get_active_infeasible_blocks(self) -> List[int]:
+        infeasible = set(self._picker.get_infeasible_blocks())
+        if self._active_workspace_mask.all():
+            return sorted(infeasible)
+
+        for block_index in range(self._num_blocks):
+            valid_workspaces = self._picker.get_valid_workspaces(block_index)
+            if not any(self._active_workspace_mask[i] for i in valid_workspaces):
+                infeasible.add(block_index)
+        return sorted(infeasible)
+
     def _init_norm_constants(self):
         """
         블록 속성·시간 정규화 상수를 '고정값'으로 1회 계산합니다.
@@ -195,7 +253,7 @@ class BlockPlacementEnv(gym.Env):
             self._max_duration = max(int(dist.duration_days.high * 0.7), 1)
             # 입고 긴급도 기준: synthetic base_date와 생성기 분산 범위
             self._base_date = self._synthetic_base_date
-            self._date_spread = max(DEFAULT_SYNTHETIC_SPREAD_DAYS, 1)
+            self._date_spread = max(self._synthetic_spread_range[1], 1)
         else:
             blocks = self._original_blocks
             self._max_length  = max((b.length  for b in blocks), default=1.0) or 1.0
@@ -338,6 +396,7 @@ class BlockPlacementEnv(gym.Env):
             self._blocks = self._generator.generate(
                 self._synthetic_n_blocks,
                 self._synthetic_base_date,
+                spread_days=self._synthetic_spread_range,
             )
             self._num_blocks = len(self._blocks)
             self._rebuild_workspaces()
@@ -363,7 +422,7 @@ class BlockPlacementEnv(gym.Env):
             self._blocks,
             self._workspaces,
             DROPOUT_THRESHOLD,
-            infeasible_indices=self._picker.get_infeasible_blocks(),
+            infeasible_indices=self._get_active_infeasible_blocks(),
         )
         self._sync_from_simulator()
 
@@ -426,12 +485,12 @@ class BlockPlacementEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         """현재 블록에 대한 유효 작업장 마스크."""
         if self._current_block_index is None:
-            return np.ones(self._num_workspaces, dtype=bool)
+            return self._active_workspace_mask.copy()
 
         mask = self._picker.get_action_mask(
             self._current_block_index, self._num_workspaces
         )
-        return np.array(mask, dtype=bool)
+        return np.array(mask, dtype=bool) & self._active_workspace_mask
 
     # ── 보상 계산 ─────────────────────────────────────────────────
 
@@ -613,6 +672,9 @@ class BlockPlacementEnv(gym.Env):
         grids = self._grid_cache.get_grids(
             self._workspaces, self._env_date
         )
+        if not self._active_workspace_mask.all():
+            grids = grids.copy()
+            grids[~self._active_workspace_mask] = 0.0
 
         # ── Workspace meta (N, 3) ────────────────────────────────
         occupancy = np.clip(
@@ -620,6 +682,8 @@ class BlockPlacementEnv(gym.Env):
         )
         placeable = self._compute_placeability(blk)
         ws_meta = np.stack([self._ws_scales, occupancy, placeable], axis=1)
+        if not self._active_workspace_mask.all():
+            ws_meta[~self._active_workspace_mask] = 0.0
 
         return {
             "block": block_features,
