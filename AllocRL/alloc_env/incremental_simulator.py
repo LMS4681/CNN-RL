@@ -127,6 +127,30 @@ class IncrementalPlacementSimulator:
     def resolved_delay_days(self) -> List[int]:
         return [d for d in self.delay_days if d is not None]
 
+    def upcoming_block_indices(self, k: int) -> List[int]:
+        """다음에 '에이전트에게 물어볼' pending 블록 인덱스를 결정 순서로 최대 k개 반환.
+
+        미래 블록 lookahead 관측용. 다음은 제외한다:
+          - 현재 결정 대상 블록(current_block_index)
+          - 하드 제약상 배치 불가로 자동 탈락하는 infeasible 블록
+          - 이미 배정되었으나 배치 실패로 지연 대기 중인 블록
+            (agent 결정 지점이 아니라 매일 자동 재시도되는 블록)
+
+        미결정 pending 블록은 아직 지연되지 않아 _sort_key가 사실상 원래 착수일
+        순서를 주므로, 실제 시뮬레이터가 블록을 제시하는 순서와 일치하는 근사
+        lookahead를 제공한다. 지연으로 인한 순서 변동은 근사로 감수한다.
+        """
+        if k <= 0:
+            return []
+        candidates = [
+            idx for idx in self.pending
+            if idx != self.current_block_index
+            and idx not in self._infeasible
+            and self.assignments[idx] is None
+        ]
+        candidates.sort(key=self._sort_key)
+        return candidates[:k]
+
     def _advance_to_next_decision(self) -> None:
         self.current_block_index = None
 

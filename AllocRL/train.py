@@ -46,6 +46,7 @@ def build_policy_kwargs(
     num_heads: int = 4,
 ) -> dict:
     from alloc_env.cnn_extractor import (
+        BlockSetAttentionCnnExtractor,
         OccupancyCnnExtractor,
         PointerAttentionCnnExtractor,
     )
@@ -53,6 +54,7 @@ def build_policy_kwargs(
     extractors = {
         "cnn": OccupancyCnnExtractor,
         "pointer-attn": PointerAttentionCnnExtractor,
+        "block-attn": BlockSetAttentionCnnExtractor,
     }
     if extractor not in extractors:
         raise ValueError(
@@ -64,7 +66,7 @@ def build_policy_kwargs(
         "features_dim": features_dim,
         "cnn_out_dim": cnn_out_dim,
     }
-    if extractor == "pointer-attn":
+    if extractor in ("pointer-attn", "block-attn"):
         extractor_kwargs.update({
             "embed_dim": embed_dim,
             "num_heads": num_heads,
@@ -81,8 +83,20 @@ def estimate_rollout_buffer_mb(
     grid_size: int,
     n_steps: int,
     n_envs: int = 1,
+    n_future_blocks: int = 0,
 ) -> float:
-    obs_bytes = (10 + n_workspaces * 3 * grid_size * grid_size + n_workspaces * 3) * 4
+    from alloc_env.alloc_env import FUTURE_BLOCK_FEATURE_DIM
+
+    future_floats = (
+        n_future_blocks * (FUTURE_BLOCK_FEATURE_DIM + 1)  # future_blocks + mask
+        if n_future_blocks > 0 else 0
+    )
+    obs_bytes = (
+        10
+        + n_workspaces * 3 * grid_size * grid_size
+        + n_workspaces * 3
+        + future_floats
+    ) * 4
     return obs_bytes * n_steps * n_envs / 1024 / 1024
 
 
@@ -108,6 +122,7 @@ def make_env(
     vary_layout=True,
     grid_size=64,
     active_workspace_codes=None,
+    n_future_blocks=0,
 ):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
@@ -121,6 +136,7 @@ def make_env(
             active_workspace_codes=active_workspace_codes,
             vary_layout=vary_layout,
             grid_size=grid_size,
+            n_future_blocks=n_future_blocks,
         )
     return _init
 
@@ -134,6 +150,7 @@ def create_training_env(
     n_envs: int = 1,
     vec_env: str = "auto",
     active_workspace_codes=None,
+    n_future_blocks: int = 0,
 ):
     """Create the training env, optionally vectorized for parallel rollout."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -150,6 +167,7 @@ def create_training_env(
         "active_workspace_codes": active_workspace_codes,
         "vary_layout": True,
         "grid_size": grid_size,
+        "n_future_blocks": n_future_blocks,
     }
 
     if resolved_vec_env == "single":
@@ -167,6 +185,7 @@ def create_evaluation_env(
     strategy,
     grid_size: int = 64,
     active_workspace_codes=None,
+    n_future_blocks: int = 0,
 ):
     """CSV 원본 블록으로 평가하는 마스크 적용 환경을 생성합니다."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -180,6 +199,7 @@ def create_evaluation_env(
         use_synthetic=False,
         active_workspace_codes=active_workspace_codes,
         grid_size=grid_size,
+        n_future_blocks=n_future_blocks,
     )
     return ActionMasker(env, mask_fn)
 
@@ -234,13 +254,24 @@ def train(args):
         n_envs=args.n_envs,
         vec_env=args.vec_env,
         active_workspace_codes=active_workspace_codes,
+        n_future_blocks=args.n_future_blocks,
     )
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
+
+    if args.extractor == "block-attn" and args.n_future_blocks == 0:
+        print(
+            "[경고] --extractor block-attn 인데 --n-future-blocks 0 입니다. "
+            "미래 블록 없이는 블록-집합 attention이 단일 토큰으로 퇴화하여 "
+            "MLP와 유사하게 동작합니다. lookahead 이점을 보려면 "
+            "--n-future-blocks 3~5 를 권장합니다."
+        )
 
     # 메모리 사용량 예측
     N = len(workspaces)
     G = args.grid_size
-    buffer_mb = estimate_rollout_buffer_mb(N, G, args.n_steps, args.n_envs)
+    buffer_mb = estimate_rollout_buffer_mb(
+        N, G, args.n_steps, args.n_envs, args.n_future_blocks
+    )
     print(f"Obs space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
     print(
@@ -328,6 +359,7 @@ def train(args):
         strategy,
         grid_size=args.grid_size,
         active_workspace_codes=active_workspace_codes,
+        n_future_blocks=args.n_future_blocks,
     )
     evaluate(model, eval_env, n_eval=args.n_eval)
 
@@ -367,59 +399,59 @@ def evaluate(model, env, n_eval: int = 5):
 
 
 def export_to_onnx(model, env, onnx_path: str):
-    """SB3 모델을 ONNX 형식으로 export (Dict obs 대응)."""
+    """SB3 모델을 ONNX 형식으로 export (Dict obs 대응, 동적 키).
+
+    관측 키 집합을 하드코딩하지 않고 observation_space에서 읽어오므로,
+    n_future_blocks > 0으로 future_blocks/future_mask가 추가되어도 그대로 export된다.
+    """
     import torch
     import onnx
 
     policy = model.policy
     obs_space = env.observation_space
 
-    # Dict obs의 각 키별 더미 입력 생성
-    dummy_obs = {}
-    if hasattr(obs_space, 'spaces'):
-        # Dict observation space
-        for key, space in obs_space.spaces.items():
-            dummy_obs[key] = torch.zeros(1, *space.shape, device=policy.device)
-    else:
-        # Flat observation space (fallback)
-        dummy_obs = torch.zeros(1, obs_space.shape[0], device=policy.device)
+    if not hasattr(obs_space, "spaces"):
+        raise ValueError(
+            "ONNX export는 Dict 관측 공간을 기대합니다 (flat obs 미지원)."
+        )
+
+    # 키 순서 고정 (gymnasium Dict는 키를 정렬 순으로 유지 → 결정적).
+    obs_keys = list(obs_space.spaces.keys())
+    dummy_obs = {
+        key: torch.zeros(1, *space.shape, device=policy.device)
+        for key, space in obs_space.spaces.items()
+    }
 
     # Actor 네트워크만 export (추론에 필요한 부분)
     class PolicyWrapper(torch.nn.Module):
-        def __init__(self, policy):
+        def __init__(self, policy, obs_keys):
             super().__init__()
             self.policy = policy
+            self._obs_keys = list(obs_keys)
 
-        def forward(self, block, grids, ws_meta):
-            obs_dict = {"block": block, "grids": grids, "ws_meta": ws_meta}
+        def forward(self, *obs_tensors):
+            obs_dict = dict(zip(self._obs_keys, obs_tensors))
             features = self.policy.extract_features(
                 obs_dict, self.policy.pi_features_extractor
             )
             latent_pi = self.policy.mlp_extractor.forward_actor(features)
             return self.policy.action_net(latent_pi)
 
-    wrapper = PolicyWrapper(policy)
+    wrapper = PolicyWrapper(policy, obs_keys)
     wrapper.eval()
 
-    # Dict obs를 개별 인자로 전달
-    dummy_inputs = (
-        dummy_obs["block"],
-        dummy_obs["grids"],
-        dummy_obs["ws_meta"],
-    )
+    # Dict obs를 키 순서대로 개별 인자로 전달
+    dummy_inputs = tuple(dummy_obs[key] for key in obs_keys)
+    dynamic_axes = {key: {0: "batch"} for key in obs_keys}
+    dynamic_axes["action_logits"] = {0: "batch"}
 
     torch.onnx.export(
         wrapper,
         dummy_inputs,
         onnx_path,
-        input_names=["block", "grids", "ws_meta"],
+        input_names=obs_keys,
         output_names=["action_logits"],
-        dynamic_axes={
-            "block": {0: "batch"},
-            "grids": {0: "batch"},
-            "ws_meta": {0: "batch"},
-            "action_logits": {0: "batch"},
-        },
+        dynamic_axes=dynamic_axes,
         opset_version=18,
     )
 
@@ -452,8 +484,12 @@ def main():
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
     parser.add_argument("--extractor", type=str, default="cnn",
-                        choices=["cnn", "pointer-attn"],
-                        help="feature extractor: cnn or pointer-attn")
+                        choices=["cnn", "pointer-attn", "block-attn"],
+                        help="feature extractor: cnn, pointer-attn, or "
+                             "block-attn (블록-집합 attention, 미래 lookahead)")
+    parser.add_argument("--n-future-blocks", type=int, default=0,
+                        help="관측에 포함할 미래 블록 개수 (0=미포함, 기존 계약 유지). "
+                             "block-attn extractor와 함께 3~5 권장.")
     parser.add_argument("--features-dim", type=int, default=256,
                         help="policy feature vector dimension")
     parser.add_argument("--cnn-out-dim", type=int, default=64,

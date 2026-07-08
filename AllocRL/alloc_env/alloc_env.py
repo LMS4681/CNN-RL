@@ -3,9 +3,12 @@
 
 - Action:  Discrete(num_workspaces) - 현재 블록을 어느 작업장에 배정
 - Obs:     Dict {
-              "block":   블록 속성 + 시간 + 스케일 정보,
-              "grids":   작업장별 3채널 점유 그리드 (N, 3, 128, 128),
-              "ws_meta": 작업장별 메타데이터 (N, 3),
+              "block":         블록 속성 + 시간 + 스케일 정보,
+              "grids":         작업장별 3채널 점유 그리드 (N, 3, G, G),
+              "ws_meta":       작업장별 메타데이터 (N, 3),
+              # 아래는 n_future_blocks > 0일 때만 추가되는 미래 lookahead:
+              "future_blocks": 다음 k개 블록 피처 (k, FUTURE_BLOCK_FEATURE_DIM),
+              "future_mask":   미래 블록 유효 마스크 (k,), 1=유효/0=패딩,
            }
 - Reward:  Terminal + shaped reward (즉시 배치 가능성 + 부분 replay)
 - Mask:    하드 제약 위반 작업장 마스킹 (sb3-contrib MaskablePPO 호환)
@@ -43,6 +46,10 @@ from .occupancy_grid import OccupancyGridRenderer, GridCache, GRID_SIZE
 # C# AllocConst 대응
 DELAY_THRESHOLD = 2       # 준수(compliance) 기준: 지연 <= 2일
 DROPOUT_THRESHOLD = 7     # 탈락(dropout) 기준: 지연 > 7일
+
+# 미래 블록 lookahead 관측 (n_future_blocks > 0일 때만 obs에 포함).
+# 각 미래 블록당 피처 차원. _future_block_features 참고.
+FUTURE_BLOCK_FEATURE_DIM = 8
 
 # ── Reward 설정 ──────────────────────────────────────────────────
 REWARD_COMPLIANT = 1.0     # 준수(지연 <= 2일)
@@ -97,12 +104,16 @@ class BlockPlacementEnv(gym.Env):
         active_workspace_codes: Optional[List[str]] = None,
         vary_layout: bool = True,
         grid_size: int = GRID_SIZE,
+        n_future_blocks: int = 0,
     ):
         super().__init__()
 
         self._original_blocks = blocks
         self._original_workspaces = workspaces
         self._strategy = strategy or BaseGridStrategy()
+
+        # 미래 블록 lookahead 관측 개수 (0이면 관측에 포함하지 않음 → 기존 계약 유지)
+        self._n_future_blocks = max(int(n_future_blocks), 0)
 
         # ── Synthetic 설정 ────────────────────────────────────────
         self._use_synthetic = use_synthetic
@@ -168,7 +179,7 @@ class BlockPlacementEnv(gym.Env):
         # ── Observation Space (Dict) ──────────────────────────────
         N = self._num_workspaces
         G = self._grid_size
-        self.observation_space = spaces.Dict({
+        obs_spaces = {
             "block": spaces.Box(
                 low=0.0, high=1.0, shape=(10,), dtype=np.float32
             ),
@@ -180,7 +191,20 @@ class BlockPlacementEnv(gym.Env):
                 low=0.0, high=1.0,
                 shape=(N, 3), dtype=np.float32
             ),
-        })
+        }
+        # 미래 블록 lookahead: 옵트인. n_future_blocks=0이면 키를 추가하지 않아
+        # 기존 관측 계약({block, grids, ws_meta})을 그대로 유지한다.
+        if self._n_future_blocks > 0:
+            obs_spaces["future_blocks"] = spaces.Box(
+                low=0.0, high=1.0,
+                shape=(self._n_future_blocks, FUTURE_BLOCK_FEATURE_DIM),
+                dtype=np.float32,
+            )
+            obs_spaces["future_mask"] = spaces.Box(
+                low=0.0, high=1.0,
+                shape=(self._n_future_blocks,), dtype=np.float32,
+            )
+        self.observation_space = spaces.Dict(obs_spaces)
 
         # ── 정규화 상수 ───────────────────────────────────────────
         self._init_norm_constants()
@@ -604,6 +628,55 @@ class BlockPlacementEnv(gym.Env):
                 placeable[i] = 1.0
         return placeable
 
+    def _future_block_features(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        다음 k개 pending 블록의 피처와 유효 마스크 (미래 lookahead 관측).
+
+        반환:
+          features (k, FUTURE_BLOCK_FEATURE_DIM):
+            [0] 길이 / max_length
+            [1] 폭 / max_breadth
+            [2] 높이 / max_height
+            [3] 중량 / max_weight
+            [4] 공기(근무일) / max_duration
+            [5] 도착 임박도: (in_date - 현재 env_date) / date_spread, [0,1] 클립
+                (0 = 지금 도착 대기, 1 = 먼 미래)
+            [6] 종횡비 (min/max)
+            [7] 면적 스케일 (블록 면적 / 최대 작업장 면적)
+          mask (k,): 유효 슬롯 1.0, 패딩 슬롯 0.0.
+
+        블록 정규화 상수는 현재 블록 피처와 동일하게 사용해 의미를 일치시킨다.
+        패딩(남은 블록 < k) 슬롯은 0으로 채운다.
+        """
+        k = self._n_future_blocks
+        features = np.zeros((k, FUTURE_BLOCK_FEATURE_DIM), dtype=np.float32)
+        mask = np.zeros(k, dtype=np.float32)
+        if k == 0 or self._placement_simulator is None:
+            return features, mask
+
+        upcoming = self._placement_simulator.upcoming_block_indices(k)
+        max_ws_area = float(self._ws_areas.max())
+        for slot, idx in enumerate(upcoming):
+            blk = self._blocks[idx]
+            features[slot] = (
+                blk.length / self._max_length,
+                blk.breadth / self._max_breadth,
+                blk.height / self._max_height,
+                blk.weight / self._max_weight,
+                blk.original_duration / self._max_duration,
+                np.clip(
+                    (blk.in_date - self._env_date).days / self._date_spread,
+                    0.0, 1.0,
+                ),
+                min(blk.length, blk.breadth)
+                / max(blk.length, blk.breadth, 1e-6),
+                np.clip(
+                    (blk.length * blk.breadth) / max_ws_area, 0.0, 1.0
+                ),
+            )
+            mask[slot] = 1.0
+        return features, mask
+
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """
         Dict 관측 구성.
@@ -685,21 +758,35 @@ class BlockPlacementEnv(gym.Env):
         if not self._active_workspace_mask.all():
             ws_meta[~self._active_workspace_mask] = 0.0
 
-        return {
+        obs = {
             "block": block_features,
             "grids": grids,
             "ws_meta": ws_meta.astype(np.float32),
         }
+        if self._n_future_blocks > 0:
+            future_blocks, future_mask = self._future_block_features()
+            obs["future_blocks"] = future_blocks
+            obs["future_mask"] = future_mask
+        return obs
 
     def _get_terminal_obs(self) -> Dict[str, np.ndarray]:
         """에피소드 종료 시 더미 관측."""
         N = self._num_workspaces
         G = self._grid_size
-        return {
+        obs = {
             "block": np.zeros(10, dtype=np.float32),
             "grids": np.zeros((N, 3, G, G), dtype=np.float32),
             "ws_meta": np.zeros((N, 3), dtype=np.float32),
         }
+        if self._n_future_blocks > 0:
+            obs["future_blocks"] = np.zeros(
+                (self._n_future_blocks, FUTURE_BLOCK_FEATURE_DIM),
+                dtype=np.float32,
+            )
+            obs["future_mask"] = np.zeros(
+                self._n_future_blocks, dtype=np.float32
+            )
+        return obs
 
     def _get_info(self) -> Dict[str, Any]:
         return {
