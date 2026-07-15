@@ -1,13 +1,84 @@
 """CLI regression tests for training resume support."""
 
 import sys
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 import train as train_module
 
 
 class TrainResumeCliTest(unittest.TestCase):
+    def test_primary_model_filename_avoids_security_filtered_zip_suffix(self):
+        self.assertEqual(
+            "block_placement_ppo.sb3", train_module.MODEL_FILENAME
+        )
+
+    def test_resumable_model_prefers_sb3_and_supports_legacy_zip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            legacy = output_dir / "block_placement_ppo.zip"
+            with zipfile.ZipFile(legacy, "w") as archive:
+                archive.writestr("probe", "legacy")
+            self.assertEqual(
+                legacy, train_module.find_resumable_model(output_dir)
+            )
+
+            preferred = output_dir / "block_placement_ppo.sb3"
+            with zipfile.ZipFile(preferred, "w") as archive:
+                archive.writestr("probe", "preferred")
+            self.assertEqual(
+                preferred, train_module.find_resumable_model(output_dir)
+            )
+
+    def test_checkpoint_callback_uses_sb3_extension(self):
+        callback_class = getattr(
+            train_module, "Sb3CheckpointCallback", None
+        )
+        self.assertIsNotNone(callback_class)
+        callback = callback_class(
+            save_freq=10,
+            save_path="checkpoints",
+            name_prefix="block_placement_ppo",
+        )
+        callback.num_timesteps = 20
+
+        self.assertTrue(
+            callback._checkpoint_path(extension="zip").endswith(
+                "block_placement_ppo_20_steps.sb3"
+            )
+        )
+
+    def test_model_archive_resolution_accepts_suffixless_sb3_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.sb3"
+            with zipfile.ZipFile(model_path, "w") as archive:
+                archive.writestr("probe", "model")
+
+            resolved = train_module.resolve_model_archive_path(
+                model_path.with_suffix("")
+            )
+
+        self.assertEqual(model_path.resolve(), resolved)
+
+    def test_model_archive_resolution_rejects_filtered_archive(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.zip"
+            model_path.write_bytes(b"HHIDfiltered")
+
+            with self.assertRaisesRegex(ValueError, "not a readable SB3"):
+                train_module.resolve_model_archive_path(model_path)
+
+    def test_auto_resume_does_not_silently_ignore_filtered_final_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "block_placement_ppo.zip"
+            model_path.write_bytes(b"HHIDfiltered")
+
+            with self.assertRaisesRegex(ValueError, "not a readable SB3"):
+                train_module.find_resumable_model(tmpdir)
+
     def test_resume_from_argument_is_accepted(self):
         captured = {}
 

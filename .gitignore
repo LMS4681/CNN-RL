@@ -51,3 +51,4 @@ AllocRL/**/events.out.tfevents.*
 AllocRL/**/*.onnx
 AllocRL/**/*.onnx.data
 AllocRL/**/*.zip
+AllocRL/**/*.sb3

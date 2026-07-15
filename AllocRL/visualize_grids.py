@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-CNN 입력용 점유 그리드 시각화 — 3채널 그리드를 이미지로 저장.
+CNN 입력용 점유 그리드 시각화 - 4채널 그리드를 이미지로 저장.
 
-각 작업장의 3채널 점유 그리드를 컬러 이미지로 변환하여 저장합니다.
+각 작업장의 실제 관측 그리드를 컬러 이미지로 변환하여 저장합니다.
 - Ch0 (점유 마스크): 빨간색
 - Ch1 (잔여 공기):   초록색  (밝을수록 출고까지 여유 있음)
 - Ch2 (경계 마스크): 파란색
+- Ch3 (후보 배치):   자홍색
 
 실행:
   py visualize_grids.py --data-dir ./data --output-dir ./output/grid_images
@@ -43,7 +44,12 @@ def visualize_grids(args):
         plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
     plt.rcParams['axes.unicode_minus'] = False
 
-    from alloc_env.data_loader import load_workspaces, load_blocks
+    from alloc_env.alloc_env import BlockPlacementEnv
+    from alloc_env.data_loader import (
+        apply_allowable_block_patterns,
+        load_blocks,
+        load_workspaces,
+    )
     from alloc_env.strategy import BaseGridStrategy
     from alloc_env.occupancy_grid import OccupancyGridRenderer
     from alloc_env.block_generator import SyntheticBlockGenerator
@@ -56,6 +62,7 @@ def visualize_grids(args):
     # ── 1. 데이터 로드 ────────────────────────────────────────────
     strategy = BaseGridStrategy(step=5.0)
     workspaces = load_workspaces(ws_csv, lot_csv, strategy)
+    apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(blk_csv, workspaces)
     print(f"작업장 {len(workspaces)}개, 블록 {len(blocks)}개 로드")
 
@@ -83,7 +90,24 @@ def visualize_grids(args):
     # ── 4. 렌더링 ─────────────────────────────────────────────────
     G = args.grid_size
     renderer = OccupancyGridRenderer(grid_size=G)
-    grids = renderer.render_all(workspaces, env_date)  # (N, 3, G, G)
+    visualization_blocks = blocks
+    if args.date:
+        later_blocks = [block for block in blocks if block.in_date >= env_date]
+        if later_blocks:
+            visualization_blocks = later_blocks
+
+    env = BlockPlacementEnv(
+        visualization_blocks,
+        workspaces,
+        strategy,
+        use_synthetic=False,
+        grid_size=G,
+        n_future_blocks=4,
+    )
+    obs, _ = env.reset(seed=args.seed)
+    grids = obs["grids"]  # (N, 4, G, G), including candidate placement
+    env_date = env.unwrapped._env_date
+    env.close()
     print(f"그리드 shape: {grids.shape}")
 
     # ── 5. 출력 디렉토리 ──────────────────────────────────────────
@@ -95,10 +119,10 @@ def visualize_grids(args):
     individual_dir.mkdir(exist_ok=True)
 
     for i, ws in enumerate(workspaces):
-        grid = grids[i]  # (3, G, G)
+        grid = grids[i]  # (4, G, G)
         scale = renderer.compute_scale_value(ws)
 
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
         fig.suptitle(
             f"{ws.code} ({ws.name})  |  "
             f"{ws.length:.0f}×{ws.breadth:.0f}m  |  "
@@ -125,11 +149,19 @@ def visualize_grids(args):
         boundary_ratio = grid[2].sum() / (G * G)
         ax.set_xlabel(f"경계 내부={boundary_ratio:.1%}")
 
-        # RGB 합성 (3채널 → 컬러)
+        # Ch3: 현재 블록의 결정론적 후보 배치
         ax = axes[3]
-        rgb = np.stack([grid[0], grid[1], grid[2]], axis=-1)  # R=점유, G=잔여, B=경계
+        ax.imshow(grid[3], cmap='magma', vmin=0, vmax=1, origin='lower')
+        ax.set_title("Ch3: 후보 배치", fontsize=11)
+        ax.set_xlabel(f"candidate={grid[3].sum():.0f}px")
+
+        # RGB 합성 + 후보 배치(자홍색)
+        ax = axes[4]
+        rgb = np.stack([grid[0], grid[1], grid[2]], axis=-1)
+        rgb[..., 0] = np.maximum(rgb[..., 0], grid[3])
+        rgb[..., 2] = np.maximum(rgb[..., 2], grid[3])
         ax.imshow(rgb, origin='lower')
-        ax.set_title("RGB 합성 (R:점유, G:잔여, B:경계)", fontsize=11)
+        ax.set_title("RGB + 후보 배치(자홍색)", fontsize=11)
 
         for ax in axes:
             ax.set_xticks([])
@@ -163,6 +195,8 @@ def visualize_grids(args):
             ws = workspaces[i]
             grid = grids[i]
             rgb = np.stack([grid[0], grid[1], grid[2]], axis=-1)
+            rgb[..., 0] = np.maximum(rgb[..., 0], grid[3])
+            rgb[..., 2] = np.maximum(rgb[..., 2], grid[3])
             ax.imshow(rgb, origin='lower')
             occ = grid[0].sum() / max(grid[2].sum(), 1) * 100
             ax.set_title(f"{ws.code}\n{ws.length:.0f}×{ws.breadth:.0f}m\nocc={occ:.0f}%",
@@ -177,8 +211,9 @@ def visualize_grids(args):
         mpatches.Patch(color='red', label='Ch0: 블록 점유'),
         mpatches.Patch(color='green', label='Ch1: 잔여 공기'),
         mpatches.Patch(color='blue', label='Ch2: 작업장 경계'),
+        mpatches.Patch(color='magenta', label='Ch3: 후보 배치'),
     ]
-    fig.legend(handles=legend_patches, loc='lower center', ncol=3, fontsize=10)
+    fig.legend(handles=legend_patches, loc='lower center', ncol=4, fontsize=10)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     overview_path = out_dir / f"grid_overview_{G}x{G}.png"
@@ -215,6 +250,7 @@ def main():
                         help="합성 블록+레이아웃으로 렌더링")
     parser.add_argument("--date", type=str, default=None,
                         help="환경 날짜 (YYYY-MM-DD)")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     visualize_grids(args)
 

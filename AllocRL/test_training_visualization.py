@@ -1,6 +1,7 @@
 """Tests for CSV loss logging and notebook-friendly training plots."""
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,11 +10,49 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import train as train_module
 from alloc_env.callbacks import AllocationCallback, TrainingMetricsCsvWriter
 from plot_training_curves import plot_training_curves
 
 
 class TrainingVisualizationTests(unittest.TestCase):
+    def test_run_config_json_round_trip(self):
+        config = {
+            "observation_schema_version": 2,
+            "extractor": "candidate-cnn",
+            "n_future_blocks": 4,
+            "grid_size": 32,
+            "active_workspace_codes": ["PE001"],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "run_config.json"
+            train_module.write_run_config(path.parent, config)
+            loader = getattr(train_module, "load_run_config", None)
+            self.assertIsNotNone(loader)
+            loaded = loader(path)
+
+        self.assertEqual(config, loaded)
+
+    def test_colab_defaults_use_candidate_cnn_without_attention_options(self):
+        notebook = json.loads(
+            Path(__file__).with_name("Colab_train.ipynb").read_text(
+                encoding="utf-8"
+            )
+        )
+        notebook_text = "\n".join(
+            "".join(cell.get("source", ""))
+            if isinstance(cell.get("source", ""), list)
+            else cell.get("source", "")
+            for cell in notebook["cells"]
+        )
+
+        self.assertIn('EXTRACTOR       = "candidate-cnn"', notebook_text)
+        self.assertIn("N_FUTURE_BLOCKS = 4", notebook_text)
+        self.assertIn("GAE_LAMBDA", notebook_text)
+        self.assertIn("SEED", notebook_text)
+        self.assertNotIn("EMBED_DIM", notebook_text)
+        self.assertNotIn("NUM_HEADS", notebook_text)
+
     def test_allocation_log_uses_resolved_reward_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             callback = AllocationCallback(tmpdir, verbose=0)

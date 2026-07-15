@@ -4,7 +4,7 @@ Colab usage:
 
     !python visualize_eval_placement.py \
       --data-dir ./data \
-      --model-path /content/drive/MyDrive/CNN_RL_output/block_placement_ppo.zip \
+      --model-path /content/drive/MyDrive/CNN_RL_output/block_placement_ppo.sb3 \
       --output-dir /content/drive/MyDrive/CNN_RL_output/eval_visualization
 """
 
@@ -23,9 +23,9 @@ import numpy as np
 from alloc_env.block import Block, PrePlacedBlock, SAFETY_DISTANCE
 from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import Workspace
+from train import load_model_run_config, resolve_model_archive_path
 
 EPSILON = 1e-5
-DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
 
 
 def parse_workspace_codes(value: str | None) -> list[str] | None:
@@ -427,18 +427,42 @@ def evaluate_model_and_export(
     data_dir: str | Path,
     model_path: str | Path,
     output_dir: str | Path,
-    grid_size: int = 64,
+    grid_size: int | None = None,
     frame_stride_days: int = 1,
-    active_workspace_codes: str | list[str] | None = DEFAULT_ACTIVE_WORKSPACE_CODES,
-    n_future_blocks: int = 0,
+    active_workspace_codes: str | list[str] | None = None,
+    n_future_blocks: int | None = None,
 ) -> list[dict[str, str]]:
     from sb3_contrib import MaskablePPO
 
-    from alloc_env.data_loader import apply_allowable_block_patterns, load_blocks, load_workspaces
+    from alloc_env.data_loader import (
+        apply_allowable_block_patterns,
+        load_blocks,
+        load_workspaces,
+        select_workspaces,
+    )
     from alloc_env.strategy import BaseGridStrategy
     from train import create_evaluation_env
 
     _setup_korean_font()  # 한글 라벨 깨짐 방지 (폰트 없으면 무시)
+
+    model_path = resolve_model_archive_path(model_path)
+    run_config = load_model_run_config(model_path)
+    grid_size = int(run_config.get("grid_size", grid_size or 64))
+    n_future_blocks = int(
+        run_config.get(
+            "n_future_blocks",
+            n_future_blocks if n_future_blocks is not None else 4,
+        )
+    )
+    configured_codes = run_config.get("active_workspace_codes")
+    if isinstance(configured_codes, str):
+        active_codes = parse_workspace_codes(configured_codes)
+    elif configured_codes is not None:
+        active_codes = list(configured_codes) or None
+    elif isinstance(active_workspace_codes, str):
+        active_codes = parse_workspace_codes(active_workspace_codes)
+    else:
+        active_codes = active_workspace_codes
 
     data_dir = Path(data_dir)
     strategy = BaseGridStrategy(step=5.0)
@@ -449,19 +473,15 @@ def evaluate_model_and_export(
     )
     apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(str(data_dir / "블록데이터.csv"), workspaces)
-    active_codes = (
-        parse_workspace_codes(active_workspace_codes)
-        if isinstance(active_workspace_codes, str)
-        else active_workspace_codes
-    )
+    workspaces = select_workspaces(workspaces, active_codes)
 
     env = create_evaluation_env(
         blocks,
         workspaces,
         strategy,
         grid_size=grid_size,
-        active_workspace_codes=active_codes,
         n_future_blocks=n_future_blocks,
+        seed=int(run_config.get("seed", 0)),
     )
     model = MaskablePPO.load(str(model_path), env=env, device="auto")
 
@@ -483,30 +503,31 @@ def evaluate_model_and_export(
         assignments,
         output_dir,
         frame_stride_days=frame_stride_days,
-        active_workspace_codes=active_codes,
+        active_workspace_codes=[workspace.code for workspace in workspaces],
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize deterministic evaluation placement")
     parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--model-path", default="./output/block_placement_ppo.zip")
+    parser.add_argument("--model-path", default="./output/block_placement_ppo.sb3")
     parser.add_argument("--output-dir", default="./output/eval_visualization")
-    parser.add_argument("--grid-size", type=int, default=64)
+    parser.add_argument(
+        "--grid-size", type=int, default=None,
+        help="fallback for legacy runs; saved run_config.json takes precedence",
+    )
     parser.add_argument("--frame-stride-days", type=int, default=1)
     parser.add_argument(
-        "--n-future-blocks", type=int, default=0,
+        "--n-future-blocks", type=int, default=None,
         help=(
-            "학습 때 사용한 미래 블록 관측 수와 반드시 동일하게 지정. "
-            "block-attn 모델은 학습 시 값(예: 4)을 그대로 주어야 관측 공간이 일치."
+            "used only when n_future_blocks is missing from run_config.json"
         ),
     )
     parser.add_argument(
         "--active-workspace-codes",
-        default=DEFAULT_ACTIVE_WORKSPACE_CODES,
+        default=None,
         help=(
-            "comma-separated active workspace codes. Evaluation action masks "
-            "and placement frames use this subset; use empty string for all."
+            "fallback for legacy runs; saved run_config.json takes precedence"
         ),
     )
     args = parser.parse_args()

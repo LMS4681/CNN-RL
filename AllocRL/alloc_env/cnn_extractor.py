@@ -172,11 +172,28 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
         observation_space: gym.spaces.Dict,
         features_dim: int = 256,
     ):
-        grid_channels = observation_space["grids"].shape[1]
+        grid_shape = observation_space["grids"].shape
+        grid_channels = grid_shape[1]
         if grid_channels != 4:
             raise ValueError(
                 f"CandidateCnnExtractor requires 4 grid channels, got {grid_channels}."
             )
+
+        # Fixed grids let AvgPool match adaptive 8x8 pooling while remaining
+        # exportable with a dynamic ONNX batch axis.
+        conv_height = (grid_shape[-2] + 3) // 4
+        conv_width = (grid_shape[-1] + 3) // 4
+        if (
+            conv_height < 8
+            or conv_width < 8
+            or conv_height % 8 != 0
+            or conv_width % 8 != 0
+        ):
+            raise ValueError(
+                "CandidateCnnExtractor grid dimensions must produce CNN "
+                "feature maps divisible into 8x8 cells."
+            )
+        pool_kernel = (conv_height // 8, conv_width // 8)
 
         super().__init__(
             observation_space,
@@ -193,7 +210,7 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((8, 8)),
+            nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_kernel),
             nn.Flatten(),
             nn.Linear(64 * 8 * 8, self.image_feature_dim),
             nn.ReLU(),

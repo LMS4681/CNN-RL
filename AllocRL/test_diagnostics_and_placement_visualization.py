@@ -10,6 +10,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import visualize_eval_placement as visualization_module
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
@@ -59,6 +60,32 @@ def make_workspace() -> Workspace:
 
 
 class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
+    def test_model_run_config_is_loaded_from_model_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            model_path = output_dir / "block_placement_ppo.sb3"
+            model_path.touch()
+            expected = {
+                "observation_schema_version": 2,
+                "extractor": "candidate-cnn",
+                "n_future_blocks": 4,
+                "grid_size": 32,
+                "active_workspace_codes": ["PE001"],
+            }
+            import json
+
+            (output_dir / "run_config.json").write_text(
+                json.dumps(expected), encoding="utf-8"
+            )
+
+            loader = getattr(
+                visualization_module, "load_model_run_config", None
+            )
+            self.assertIsNotNone(loader)
+            loaded = loader(model_path)
+
+        self.assertEqual(expected, loaded)
+
     def test_synthetic_diagnostic_report_flags_zero_valid_synthetic_blocks(self):
         workspace = make_workspace()
         workspace.set_allowable_block_patterns(["A*"])

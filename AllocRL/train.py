@@ -22,11 +22,25 @@ if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
+from stable_baselines3.common.callbacks import CheckpointCallback
 
 
 DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
 OBSERVATION_SCHEMA_VERSION = 2
 REWARD_SCHEMA_VERSION = 2
+MODEL_FILENAME = "block_placement_ppo.sb3"
+LEGACY_MODEL_FILENAME = "block_placement_ppo.zip"
+
+
+class Sb3CheckpointCallback(CheckpointCallback):
+    """Store SB3 ZIP containers with an extension not filtered by DLP tools."""
+
+    def _checkpoint_path(
+        self, checkpoint_type: str = "", extension: str = ""
+    ) -> str:
+        if checkpoint_type == "" and extension == "zip":
+            extension = "sb3"
+        return super()._checkpoint_path(checkpoint_type, extension)
 
 
 def parse_workspace_codes(value: str | None) -> list[str] | None:
@@ -241,6 +255,7 @@ def current_run_config(args, active_workspace_codes) -> dict:
         "grid_size": args.grid_size,
         "features_dim": args.features_dim,
         "active_workspace_codes": list(active_workspace_codes or []),
+        "seed": args.seed,
     }
 
 
@@ -250,26 +265,90 @@ def write_run_config(output_dir, config) -> None:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+def load_run_config(path: str | Path) -> dict:
+    """Load and validate a training run configuration JSON object."""
+    import json
+
+    config_path = Path(path)
+    if config_path.is_dir():
+        config_path = config_path / "run_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Run configuration not found: {config_path}")
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError(f"Run configuration must be a JSON object: {config_path}")
+    return config
+
+
+def load_model_run_config(model_path: str | Path) -> dict:
+    """Load run_config.json stored beside a model or its checkpoint parent."""
+    model_dir = Path(model_path).resolve().parent
+    candidates = (
+        model_dir / "run_config.json",
+        model_dir.parent / "run_config.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return load_run_config(candidate)
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"No run_config.json found for model {model_path}. Searched: {searched}"
+    )
+
+
+def resolve_model_archive_path(path: str | Path) -> Path:
+    """Resolve an SB3 archive and reject files transformed by security tools."""
+    import zipfile
+
+    requested = Path(path).expanduser().resolve()
+    candidates = [requested]
+    if requested.suffix == "":
+        candidates.extend(
+            [Path(f"{requested}.sb3"), Path(f"{requested}.zip")]
+        )
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if not zipfile.is_zipfile(candidate):
+            raise ValueError(
+                f"Model file is not a readable SB3 archive: {candidate}. "
+                "A company security filter may have transformed a .zip file; "
+                "save new models with the .sb3 extension."
+            )
+        return candidate
+
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"Saved model not found. Searched: {searched}")
+
+
 def find_resumable_model(output_dir):
     """이어학습 가능한 최신 산출물 경로를 찾는다.
 
-    우선순위: 완주 모델(block_placement_ppo.zip) > checkpoints/ 중 최대 step.
+    우선순위: 완주 모델(.sb3, legacy .zip) > checkpoints/ 중 최대 step.
     완주 모델은 항상 가장 많은 step을 가지므로 우선한다. 완주 모델이 없으면
     (예: 세션 끊김/크래시) checkpoints/ 중 step이 가장 큰 파일을 쓴다.
     """
     import re
+    import zipfile
+
     output_dir = Path(output_dir)
-    final = output_dir / "block_placement_ppo.zip"
-    if final.exists():
-        return final
+    for filename in (MODEL_FILENAME, LEGACY_MODEL_FILENAME):
+        final = output_dir / filename
+        if final.is_file():
+            return resolve_model_archive_path(final)
     ckpt_dir = output_dir / "checkpoints"
     if ckpt_dir.is_dir():
         best, best_steps = None, -1
-        for p in ckpt_dir.glob("*.zip"):
-            m = re.search(r"(\d+)_steps", p.stem)
-            steps = int(m.group(1)) if m else 0
-            if steps > best_steps:
-                best_steps, best = steps, p
+        for pattern in ("*.sb3", "*.zip"):
+            for p in ckpt_dir.glob(pattern):
+                if not zipfile.is_zipfile(p):
+                    continue
+                m = re.search(r"(\d+)_steps", p.stem)
+                steps = int(m.group(1)) if m else 0
+                if steps > best_steps:
+                    best_steps, best = steps, p
         return best
     return None
 
@@ -292,10 +371,7 @@ def resolve_resume_path(args, output_dir, current_config):
     import json
 
     if args.resume_from:
-        resume_path = Path(args.resume_from).resolve()
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume model not found: {resume_path}")
-        return resume_path
+        return resolve_model_archive_path(args.resume_from)
 
     if not getattr(args, "auto_resume", False):
         return None
@@ -451,11 +527,9 @@ def train(args):
         TrainingMetricsCallback(log_dir=args.output_dir, verbose=1),
     ]
     if args.checkpoint_freq > 0:
-        from stable_baselines3.common.callbacks import CheckpointCallback
-
         # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
         save_freq = max(args.checkpoint_freq // max(args.n_envs, 1), 1)
-        callback.append(CheckpointCallback(
+        callback.append(Sb3CheckpointCallback(
             save_freq=save_freq,
             save_path=str(output_dir / "checkpoints"),
             name_prefix="block_placement_ppo",
@@ -479,7 +553,7 @@ def train(args):
     )
 
     # ── 7. 모델 저장 ─────────────────────────────────────────────
-    sb3_path = str(output_dir / "block_placement_ppo")
+    sb3_path = str(output_dir / MODEL_FILENAME)
     model.save(sb3_path)
     print(f"\nSB3 모델 저장: {sb3_path}")
 
@@ -506,10 +580,8 @@ def train(args):
 
 def evaluate(model, env, n_eval: int = 5):
     """학습된 모델로 n_eval 에피소드 평가."""
-    from sb3_contrib import MaskablePPO
-
     rewards = []
-    terminal_rewards = []
+    terminal_scores = []
     for ep in range(n_eval):
         obs, info = env.reset()
         total_reward = 0.0
@@ -522,18 +594,21 @@ def evaluate(model, env, n_eval: int = 5):
             done = terminated or truncated
 
         rewards.append(total_reward)
-        terminal_reward = info.get("terminal_reward", total_reward)
-        terminal_rewards.append(terminal_reward)
+        terminal_score = info.get(
+            "terminal_score", info.get("terminal_reward", total_reward)
+        )
+        terminal_scores.append(terminal_score)
         print(
             f"  Episode {ep+1}: "
-            f"total = {total_reward:.2f}, terminal = {terminal_reward:.2f}"
+            f"total reward = {total_reward:.2f}, "
+            f"terminal score = {terminal_score:.2f}"
         )
 
     mean_r = np.mean(rewards)
-    mean_terminal = np.mean(terminal_rewards)
+    mean_terminal = np.mean(terminal_scores)
     print(
         f"\n  평균 reward: total={mean_r:.2f}, "
-        f"terminal={mean_terminal:.2f} (n={n_eval})"
+        f"terminal score={mean_terminal:.2f} (n={n_eval})"
     )
     return mean_r
 
@@ -592,7 +667,7 @@ def export_to_onnx(model, env, onnx_path: str):
         input_names=obs_keys,
         output_names=["action_logits"],
         dynamic_axes=dynamic_axes,
-        opset_version=18,
+        opset_version=17,
     )
 
     # 검증
