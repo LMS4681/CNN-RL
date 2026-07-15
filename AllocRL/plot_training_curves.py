@@ -44,14 +44,30 @@ def _plot_reward(ax, reward_df: pd.DataFrame, smooth_window: int) -> None:
         return
 
     x_col = "timestep" if "timestep" in reward_df.columns else "episode"
-    y_col = "episode_reward" if "episode_reward" in reward_df.columns else "reward"
+    if "episode_reward" in reward_df.columns:
+        y_col = "episode_reward"
+    elif "terminal_score" in reward_df.columns:
+        y_col = "terminal_score"
+    else:
+        y_col = "reward"
 
     x = _to_numeric(reward_df, x_col)
     y = _to_numeric(reward_df, y_col)
     ax.plot(x, y, label=y_col, linewidth=1.5)
-    if "reward" in reward_df.columns and y_col != "reward":
-        terminal = _to_numeric(reward_df, "reward")
-        ax.plot(x, terminal, label="terminal_reward", linewidth=1.2, alpha=0.75)
+    score_col = None
+    if "terminal_score" in reward_df.columns:
+        score_col = "terminal_score"
+    elif "reward" in reward_df.columns:
+        score_col = "reward"
+    if score_col is not None and y_col != score_col:
+        terminal = _to_numeric(reward_df, score_col)
+        ax.plot(
+            x,
+            terminal,
+            label=score_col,
+            linewidth=1.2,
+            alpha=0.75,
+        )
 
     if smooth_window > 1 and len(y) >= smooth_window:
         smoothed = y.rolling(smooth_window, min_periods=1).mean()

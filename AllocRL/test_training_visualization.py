@@ -9,11 +9,27 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-from alloc_env.callbacks import TrainingMetricsCsvWriter
+from alloc_env.callbacks import AllocationCallback, TrainingMetricsCsvWriter
 from plot_training_curves import plot_training_curves
 
 
 class TrainingVisualizationTests(unittest.TestCase):
+    def test_allocation_log_uses_resolved_reward_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            callback = AllocationCallback(tmpdir, verbose=0)
+            callback._on_training_start()
+            callback._on_training_end()
+
+            with open(
+                Path(tmpdir) / "training_log.csv", encoding="utf-8"
+            ) as file:
+                header = next(csv.reader(file))
+
+        self.assertIn("resolved_reward", header)
+        self.assertIn("terminal_residual", header)
+        self.assertIn("terminal_score", header)
+        self.assertNotIn("shaped_reward", header)
+
     def test_training_metrics_writer_records_train_losses(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = TrainingMetricsCsvWriter(tmpdir)
@@ -26,6 +42,10 @@ class TrainingVisualizationTests(unittest.TestCase):
                     "train/clip_fraction": 0.2,
                     "train/loss": 0.9,
                     "train/explained_variance": 0.4,
+                    "diagnostics/cnn_gradient_norm": 2.5,
+                    "diagnostics/cnn_weight_change": 0.03,
+                    "diagnostics/workspace_feature_variance": 0.4,
+                    "diagnostics/candidate_channel_sensitivity": 0.2,
                 },
                 {},
                 step=128,
@@ -39,6 +59,8 @@ class TrainingVisualizationTests(unittest.TestCase):
         self.assertEqual("128", rows[0]["timestep"])
         self.assertEqual("-0.120000", rows[0]["policy_gradient_loss"])
         self.assertEqual("1.500000", rows[0]["value_loss"])
+        self.assertEqual("2.500000", rows[0]["cnn_gradient_norm"])
+        self.assertEqual("0.200000", rows[0]["candidate_channel_sensitivity"])
 
     def test_training_metrics_writer_skips_non_train_dumps(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -57,11 +79,12 @@ class TrainingVisualizationTests(unittest.TestCase):
             with open(output_dir / "training_log.csv", "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "episode", "timestep", "reward", "shaped_reward", "episode_reward",
+                    "episode", "timestep", "resolved_reward", "terminal_residual",
+                    "terminal_score", "episode_reward",
                     "delayed_count", "dropout_count", "total_delay_days", "success_rate",
                 ])
-                writer.writerow([1, 100, -1.0, 0.2, -0.8, 3, 1, 7, 0.5])
-                writer.writerow([2, 200, -0.5, 0.3, -0.2, 2, 0, 3, 0.7])
+                writer.writerow([1, 100, -0.8, 0.0, -0.8, -0.8, 3, 1, 7, 0.5])
+                writer.writerow([2, 200, -0.2, 0.0, -0.2, -0.2, 2, 0, 3, 0.7])
 
             with open(output_dir / "loss_log.csv", "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -90,7 +113,8 @@ class TrainingVisualizationTests(unittest.TestCase):
             with open(output_dir / "training_log.csv", "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "episode", "timestep", "reward", "shaped_reward", "episode_reward",
+                    "episode", "timestep", "resolved_reward", "terminal_residual",
+                    "terminal_score", "episode_reward",
                     "delayed_count", "dropout_count", "total_delay_days", "success_rate",
                 ])
 
