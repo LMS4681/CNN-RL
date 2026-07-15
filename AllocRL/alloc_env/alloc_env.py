@@ -4,7 +4,7 @@
 - Action:  Discrete(num_workspaces) - 현재 블록을 어느 작업장에 배정
 - Obs:     Dict {
               "block":         블록 속성 + 시간 + 스케일 정보,
-              "grids":         작업장별 3채널 점유 그리드 (N, 3, G, G),
+              "grids":         작업장별 4채널 후보 점유 그리드 (N, 4, G, G),
               "ws_meta":       작업장별 메타데이터 (N, 3),
               # 아래는 n_future_blocks > 0일 때만 추가되는 미래 lookahead:
               "future_blocks": 다음 k개 블록 피처 (k, FUTURE_BLOCK_FEATURE_DIM),
@@ -14,7 +14,7 @@
 - Mask:    하드 제약 위반 작업장 마스킹 (sb3-contrib MaskablePPO 호환)
 
 CNN 관측 핵심:
-  - 3채널: 점유 마스크 / 잔여 출고 공기 / 작업장 경계
+  - 4채널: 점유 / 잔여 출고 공기 / 작업장 경계 / 현재 블록 후보
   - 비율 유지 리사이즈: 모든 작업장이 128×128 그리드에 수용
   - 그리드 캐싱: 변경된 작업장만 재렌더링
   - 작업장 레이아웃 합성: 매 에피소드마다 크기 변형
@@ -40,7 +40,12 @@ from .incremental_simulator import (
 )
 from .simulator import SimulationResult
 from .strategy import BaseGridStrategy
-from .occupancy_grid import OccupancyGridRenderer, GridCache, GRID_SIZE
+from .occupancy_grid import (
+    CandidatePlacement,
+    GridCache,
+    GRID_SIZE,
+    OccupancyGridRenderer,
+)
 
 # C# AllocConst 대응
 DELAY_THRESHOLD = 2       # 준수(compliance) 기준: 지연 <= 2일
@@ -67,7 +72,7 @@ class BlockPlacementEnv(gym.Env):
     블록 배치 강화학습 환경 (CNN 관측 버전).
 
     에이전트는 각 블록을 하나씩 순차적으로 받고,
-    3채널 점유 그리드를 통해 작업장 공간 상태를 인식한 후
+    4채널 후보 점유 그리드를 통해 작업장 공간 상태를 인식한 후
     어느 작업장에 배정할지 결정합니다.
 
     Reward:
@@ -78,7 +83,7 @@ class BlockPlacementEnv(gym.Env):
 
     Observation: Dict
       "block"  : (10,)           - 블록 물리 속성 5 + 시간 3 + 진행률 + 블록 스케일
-      "grids"  : (N, 3, 128, 128) - 작업장별 3채널 점유 그리드
+      "grids"  : (N, 4, 128, 128) - 작업장별 4채널 후보 점유 그리드
       "ws_meta": (N, 3)          - 작업장별 (scale, occupancy_ratio, placeable_now)
 
     use_synthetic=True일 때 매 에피소드마다 랜덤 블록 + 레이아웃 변형.
@@ -188,7 +193,7 @@ class BlockPlacementEnv(gym.Env):
             ),
             "grids": spaces.Box(
                 low=0.0, high=1.0,
-                shape=(N, 3, G, G), dtype=np.float32
+                shape=(N, 4, G, G), dtype=np.float32
             ),
             "ws_meta": spaces.Box(
                 low=0.0, high=1.0,
@@ -225,6 +230,7 @@ class BlockPlacementEnv(gym.Env):
         self._last_result: Optional[SimulationResult] = None
         self._placement_simulator: Optional[IncrementalPlacementSimulator] = None
         self._current_block_index: Optional[int] = None
+        self._candidate_placements: List[CandidatePlacement] = []
 
     # ── 정규화 상수 갱신 ──────────────────────────────────────────
 
@@ -599,39 +605,42 @@ class BlockPlacementEnv(gym.Env):
 
     # ── 관측 헬퍼 ────────────────────────────────────────────────
 
-    def _compute_placeability(self, blk: Block) -> np.ndarray:
-        """
-        현재 블록을 각 작업장에 'env_date 기준 지금' 즉시 배치할 수 있는지 여부.
+    def _compute_candidate_placements(
+        self,
+        blk: Block,
+    ) -> List[CandidatePlacement]:
+        candidates: List[CandidatePlacement] = []
+        hard_mask = self.action_masks()
+        for allowed, workspace in zip(hard_mask, self._workspaces):
+            if not allowed:
+                candidates.append(
+                    CandidatePlacement(
+                        None, blk.length, blk.breadth, rotated=False
+                    )
+                )
+                continue
 
-        시뮬레이터가 실제 배치에 쓰는 strategy.determine_position을 그대로 호출하므로
-        즉시 배치 성공을 정확히 예측한다(90° 회전 재시도 포함). 하드 제약(치수/패턴)에
-        걸리는 작업장은 계산을 건너뛰고 0으로 둔다.
+            trial = blk.clone()
+            position = workspace.determine_placement_position(
+                trial, self._env_date
+            )
+            rotated = False
+            if position is None:
+                trial.turn()
+                rotated = True
+                position = workspace.determine_placement_position(
+                    trial, self._env_date
+                )
 
-        이 신호는 '피처'이지 '마스크'가 아니다 — 지금 꽉 차 있어도 나중에 블록이
-        출고되어 자리가 나길 기다리는 전략이 유효하므로 하드 마스킹하지 않는다.
-
-        성능: 결정마다 최대 N번의 determine_position 탐색이 든다. 빈 작업장은 즉시
-        반환되어 저렴하지만 꽉 찬 작업장은 탐색을 소진한다(백로그 D의 캐싱 대상).
-        """
-        n = self._num_workspaces
-        placeable = np.zeros(n, dtype=np.float32)
-        if self._current_block_index is None:
-            return placeable
-
-        mask = self.action_masks()  # 하드 제약(치수/패턴) 통과 여부
-        env_date = self._env_date
-        for i, ws in enumerate(self._workspaces):
-            if not mask[i]:
-                continue  # 치수/패턴상 애초에 배치 불가 → 0
-            pos = ws.determine_placement_position(blk, env_date)
-            if pos is None:
-                # 시뮬레이터와 동일하게 90° 회전 후 재시도
-                blk.turn()
-                pos = ws.determine_placement_position(blk, env_date)
-                blk.turn()  # 원래 방향 복원 (turn은 자기 역연산)
-            if pos is not None:
-                placeable[i] = 1.0
-        return placeable
+            candidates.append(
+                CandidatePlacement(
+                    position,
+                    trial.length,
+                    trial.breadth,
+                    rotated=rotated if position is not None else False,
+                )
+            )
+        return candidates
 
     def _future_block_features(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -698,10 +707,11 @@ class BlockPlacementEnv(gym.Env):
           [8]  현재 블록 면적 스케일      (블록 면적 / 최대 작업장 면적)
           [9]  현재 블록 최대 축 비율     (max(L,B) / 최대 작업장 축)
 
-        "grids" (N, 3, 128, 128):
+        "grids" (N, 4, 128, 128):
           Ch0: 블록 점유 마스크
           Ch1: 잔여 출고 공기 (정규화)
           Ch2: 작업장 경계 마스크
+          Ch3: 현재 블록의 후보 배치 마스크
 
         "ws_meta" (N, 3):
           [0] scale (1px당 m, 정규화)
@@ -746,10 +756,18 @@ class BlockPlacementEnv(gym.Env):
             ),
         ], dtype=np.float32)
 
-        # ── Workspace grids (N, 3, 128, 128) ─────────────────────
-        grids = self._grid_cache.get_grids(
+        # ── Workspace grids (N, 4, 128, 128) ─────────────────────
+        base_grids = self._grid_cache.get_grids(
             self._workspaces, self._env_date
         )
+        self._candidate_placements = self._compute_candidate_placements(blk)
+        candidate_masks = np.stack([
+            self._renderer.render_candidate_mask(workspace, candidate)
+            for workspace, candidate in zip(
+                self._workspaces, self._candidate_placements
+            )
+        ])
+        grids = np.concatenate([base_grids, candidate_masks], axis=1)
         if not self._active_workspace_mask.all():
             grids = grids.copy()
             grids[~self._active_workspace_mask] = 0.0
@@ -758,7 +776,10 @@ class BlockPlacementEnv(gym.Env):
         occupancy = np.clip(
             self._ws_used_area / self._ws_areas, 0.0, 1.0
         )
-        placeable = self._compute_placeability(blk)
+        placeable = np.array(
+            [candidate.placeable for candidate in self._candidate_placements],
+            dtype=np.float32,
+        )
         ws_meta = np.stack([self._ws_scales, occupancy, placeable], axis=1)
         if not self._active_workspace_mask.all():
             ws_meta[~self._active_workspace_mask] = 0.0
@@ -780,7 +801,7 @@ class BlockPlacementEnv(gym.Env):
         G = self._grid_size
         obs = {
             "block": np.zeros(10, dtype=np.float32),
-            "grids": np.zeros((N, 3, G, G), dtype=np.float32),
+            "grids": np.zeros((N, 4, G, G), dtype=np.float32),
             "ws_meta": np.zeros((N, 3), dtype=np.float32),
         }
         if self._n_future_blocks > 0:

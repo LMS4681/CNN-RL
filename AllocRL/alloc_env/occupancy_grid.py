@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
@@ -27,6 +28,18 @@ from .workspace import Workspace
 GRID_SIZE = 64
 NUM_CHANNELS = 3
 MAX_REMAINING_DAYS = 60  # 잔여 공기 정규화 기준 (60일 이상은 1.0으로 클리핑)
+
+
+@dataclass(frozen=True)
+class CandidatePlacement:
+    position: Optional[Tuple[float, float]]
+    length: float
+    breadth: float
+    rotated: bool
+
+    @property
+    def placeable(self) -> bool:
+        return self.position is not None
 
 
 class OccupancyGridRenderer:
@@ -106,6 +119,30 @@ class OccupancyGridRenderer:
             grids[i] = self.render(ws, env_date, max_remaining_days)
         return grids
 
+    def render_candidate_mask(
+        self,
+        ws: Workspace,
+        candidate: CandidatePlacement,
+    ) -> np.ndarray:
+        mask = np.zeros(
+            (1, self.grid_size, self.grid_size), dtype=np.float32
+        )
+        if candidate.position is None:
+            return mask
+
+        center_x, center_y = candidate.position
+        self._render_rectangle(
+            mask[0],
+            ws,
+            self._compute_scale(ws),
+            center_x,
+            center_y,
+            candidate.length,
+            candidate.breadth,
+            value=1.0,
+        )
+        return mask
+
     def compute_scale_value(self, ws: Workspace) -> float:
         """
         작업장의 1px당 미터 수 (정규화용).
@@ -180,32 +217,48 @@ class OccupancyGridRenderer:
         out_date: date,
     ) -> None:
         """단일 블록을 그리드에 렌더링 (Ch0, Ch1)."""
-        G = self.grid_size
-        scale = scale_info["scale"]
-        offset_x = scale_info["offset_x"]
-        offset_y = scale_info["offset_y"]
-
-        # 블록의 좌하단 좌표 (센터 → 좌하단)
-        bx0 = pos_x - length / 2.0 - ws.origin_x
-        by0 = pos_y - breadth / 2.0 - ws.origin_y
-
-        # 픽셀 좌표 (정수 변환)
-        px0 = max(0, int(bx0 * scale) + offset_x)
-        py0 = max(0, int(by0 * scale) + offset_y)
-        px1 = min(G, int((bx0 + length) * scale) + offset_x)
-        py1 = min(G, int((by0 + breadth) * scale) + offset_y)
-
-        if px1 <= px0 or py1 <= py0:
-            return  # 너무 작아서 렌더링 불가
-
-        # Ch0: 점유 마스크
-        grid[0, py0:py1, px0:px1] = 1.0
+        self._render_rectangle(
+            grid[0], ws, scale_info,
+            pos_x, pos_y, length, breadth, value=1.0,
+        )
 
         # Ch1: 잔여 출고 공기 (정규화)
         remaining = (out_date - env_date).days
         remaining = max(0, remaining)
         norm_remaining = min(remaining / max_remaining_days, 1.0)
-        grid[1, py0:py1, px0:px1] = norm_remaining
+        self._render_rectangle(
+            grid[1], ws, scale_info,
+            pos_x, pos_y, length, breadth, value=norm_remaining,
+        )
+
+    def _render_rectangle(
+        self,
+        channel: np.ndarray,
+        ws: Workspace,
+        scale_info: Dict,
+        center_x: float,
+        center_y: float,
+        length: float,
+        breadth: float,
+        value: float,
+    ) -> None:
+        scale = scale_info["scale"]
+        offset_x = scale_info["offset_x"]
+        offset_y = scale_info["offset_y"]
+        x0 = center_x - length / 2.0 - ws.origin_x
+        y0 = center_y - breadth / 2.0 - ws.origin_y
+        px0 = max(0, int(x0 * scale) + offset_x)
+        py0 = max(0, int(y0 * scale) + offset_y)
+        px1 = min(
+            self.grid_size,
+            int((x0 + length) * scale) + offset_x,
+        )
+        py1 = min(
+            self.grid_size,
+            int((y0 + breadth) * scale) + offset_y,
+        )
+        if px1 > px0 and py1 > py0:
+            channel[py0:py1, px0:px1] = value
 
 
 class GridCache:

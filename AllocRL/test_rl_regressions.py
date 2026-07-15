@@ -246,7 +246,7 @@ class RlRegressionTests(unittest.TestCase):
 
         obs, _ = env.reset()
 
-        self.assertEqual((2, 3, 32, 32), obs["grids"].shape)
+        self.assertEqual((2, 4, 32, 32), obs["grids"].shape)
         self.assertEqual((2, 3), obs["ws_meta"].shape)
         self.assertEqual([True, False], env.action_masks().tolist())
         self.assertGreater(float(obs["grids"][0].sum()), 0.0)
@@ -327,7 +327,8 @@ class RlRegressionTests(unittest.TestCase):
         expected_grids = np.stack([
             original_render(ws, env._env_date) for ws in env._workspaces
         ], axis=0)
-        np.testing.assert_array_equal(obs["grids"], expected_grids)
+        np.testing.assert_array_equal(obs["grids"][:, :3], expected_grids)
+        self.assertGreater(float(obs["grids"][:, 3].sum()), 0.0)
 
     def test_step_moves_observation_date_to_next_block(self):
         blocks = [

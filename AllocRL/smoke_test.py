@@ -164,7 +164,7 @@ obs, info = env.reset()
 check("obs Dict 키", set(obs.keys()) == {"block", "grids", "ws_meta"})
 check("obs['block'] shape", obs["block"].shape == (10,), f"got {obs['block'].shape}")
 check("obs['grids'] shape",
-      obs["grids"].shape == (N, 3, G, G),
+      obs["grids"].shape == (N, 4, G, G),
       f"got {obs['grids'].shape}")
 check("obs['ws_meta'] shape",
       obs["ws_meta"].shape == (N, 3),
