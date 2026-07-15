@@ -3,7 +3,8 @@
 RL 의존성(torch/gym/numpy) 없이 base python에서 실행 가능:
     py test_future_block_lookahead.py
 
-관측/extractor 레벨 테스트는 test_block_attention_and_future_obs.py (torch/gym 필요) 참고.
+관측/extractor 레벨 테스트는 test_candidate_observation.py와
+test_feature_extractors.py (torch/gym 필요) 참고.
 """
 
 import unittest
