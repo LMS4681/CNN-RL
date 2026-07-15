@@ -453,7 +453,9 @@ def evaluate_fixed_scenarios(
     scenario_records: list[dict],
     grid_size: int,
     n_future_blocks: int,
+    workspace_codes: list[str] | None = None,
 ) -> list[dict]:
+    from alloc_env.data_loader import select_workspaces_in_order
     from alloc_env.strategy import BaseGridStrategy
     from evaluation_scenarios import materialize_scenario
 
@@ -461,6 +463,9 @@ def evaluate_fixed_scenarios(
     for scenario in scenario_records:
         strategy = BaseGridStrategy(step=5.0)
         blocks, workspaces = materialize_scenario(scenario, strategy)
+        workspaces = select_workspaces_in_order(
+            workspaces, workspace_codes
+        )
         env = create_evaluation_env(
             blocks=blocks,
             workspaces=workspaces,
@@ -606,8 +611,12 @@ def train(args):
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
-        AllocationCallback(log_dir=args.output_dir, verbose=1),
-        TrainingMetricsCallback(log_dir=args.output_dir, verbose=1),
+        AllocationCallback(
+            log_dir=args.output_dir, verbose=1, append=is_resume
+        ),
+        TrainingMetricsCallback(
+            log_dir=args.output_dir, verbose=1, append=is_resume
+        ),
     ]
     if args.checkpoint_freq > 0:
         # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
@@ -676,6 +685,9 @@ def train(args):
             fixed_scenarios,
             grid_size=args.grid_size,
             n_future_blocks=args.n_future_blocks,
+            workspace_codes=[
+                workspace.code for workspace in workspaces
+            ],
         )
         write_evaluation_metrics(
             output_dir / "evaluation_scenarios.csv", scenario_rows
@@ -718,14 +730,30 @@ def evaluate(model, env, n_eval: int = 5, return_metrics: bool = False):
             else:
                 future_indices = []
                 choices_before = 0
+            if hasattr(
+                diagnostic_env,
+                "future_workspace_choice_count_after_action",
+            ):
+                choices_after = (
+                    diagnostic_env.future_workspace_choice_count_after_action(
+                        int(action), future_indices
+                    )
+                )
+            else:
+                choices_after = None
             obs, reward, terminated, truncated, info = env.step(action)
-            if hasattr(diagnostic_env, "future_workspace_choice_count"):
+            if (
+                choices_after is None
+                and hasattr(
+                    diagnostic_env, "future_workspace_choice_count"
+                )
+            ):
                 choices_after = (
                     diagnostic_env.future_workspace_choice_count(
                         future_indices
                     )
                 )
-            else:
+            elif choices_after is None:
                 choices_after = 0
             episode_choice_ratios.append(
                 compute_retained_choice_ratio(

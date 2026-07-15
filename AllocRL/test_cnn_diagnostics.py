@@ -73,6 +73,21 @@ class CnnDiagnosticTrackerTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["workspace_feature_variance"], 0.0)
         self.assertGreater(metrics["candidate_channel_sensitivity"], 0.0)
 
+    def test_workspace_feature_variance_uses_only_workspace_axis(self):
+        extractor = CandidateCnnExtractor(
+            space(), features_dim=32
+        ).eval()
+        observations = observation()
+        observations["grids"][:, 1] = observations["grids"][:, 0]
+
+        metrics = CnnDiagnosticTracker(extractor).measure_features(
+            observations
+        )
+
+        self.assertAlmostEqual(
+            0.0, metrics["workspace_feature_variance"], places=7
+        )
+
     def test_non_cnn_extractors_emit_no_cnn_metrics(self):
         for extractor_class in (StructuredExtractor, FixedGridExtractor):
             with self.subTest(extractor=extractor_class.__name__):

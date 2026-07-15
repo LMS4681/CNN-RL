@@ -178,7 +178,7 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual(3.0, compute_retained_choice_ratio(0, 3))
         self.assertEqual(0.5, compute_retained_choice_ratio(4, 2))
 
-    def test_future_choice_count_compares_the_same_future_blocks(self):
+    def test_future_choice_count_previews_immediate_post_action_state(self):
         env = self.make_choice_env()
         self.assertEqual(0, env.future_workspace_choice_count())
         env.reset(seed=0)
@@ -190,8 +190,9 @@ class EvaluationScenarioTests(unittest.TestCase):
         workspace_counts = [len(ws.blocks) for ws in env._workspaces]
 
         before = env.future_workspace_choice_count(future_indices)
-        env.step(0)
-        after = env.future_workspace_choice_count(future_indices)
+        after = env.future_workspace_choice_count_after_action(
+            0, future_indices
+        )
 
         self.assertEqual(4, before)
         self.assertEqual(2, after)
@@ -203,9 +204,23 @@ class EvaluationScenarioTests(unittest.TestCase):
                 for block in env._blocks[1:]
             ],
         )
-        self.assertEqual([1, 0], [len(ws.blocks) for ws in env._workspaces])
         self.assertEqual([0, 0], workspace_counts)
+        self.assertEqual([0, 0], [len(ws.blocks) for ws in env._workspaces])
         env.close()
+
+    def test_evaluate_uses_immediate_post_action_choice_preview(self):
+        env = self.make_choice_env()
+        env.future_workspace_choice_count = lambda block_indices=None: 4
+        env.future_workspace_choice_count_after_action = (
+            lambda action, block_indices=None: 1
+        )
+
+        metrics = evaluate(
+            FirstValidModel(), env, n_eval=1, return_metrics=True
+        )
+        env.close()
+
+        self.assertEqual(0.25, metrics["mean_retained_choice_ratio"])
 
     def test_evaluate_can_return_quality_and_retained_choice_metrics(self):
         env = self.make_choice_env()

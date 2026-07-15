@@ -7,7 +7,10 @@ import torch
 
 from alloc_env.block import Block
 from alloc_env.block_generator import SyntheticBlockGenerator
-from alloc_env.data_loader import select_workspaces
+from alloc_env.data_loader import (
+    select_workspaces,
+    select_workspaces_in_order,
+)
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 from train import create_evaluation_env, create_training_env, set_global_seed
@@ -66,6 +69,15 @@ class WorkspaceFilteringAndSeedTests(unittest.TestCase):
     def test_select_workspaces_rejects_unknown_codes(self):
         with self.assertRaisesRegex(ValueError, "Unknown active workspace"):
             select_workspaces([workspace("PE001")], ["PE999"])
+
+    def test_select_workspaces_in_order_restores_recorded_action_order(self):
+        source = [workspace("PE003"), workspace("PE001"), workspace("PE002")]
+
+        selected = select_workspaces_in_order(
+            source, ["pe002", "PE003"]
+        )
+
+        self.assertEqual(["PE002", "PE003"], [ws.code for ws in selected])
 
     def test_filtered_environment_has_filtered_shapes(self):
         selected = select_workspaces(

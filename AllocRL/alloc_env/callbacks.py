@@ -91,7 +91,7 @@ class CnnDiagnosticTracker:
         ).mean()
         return {
             "workspace_feature_variance": float(
-                normal.var(unbiased=False).item()
+                normal.var(dim=1, unbiased=False).mean().item()
             ),
             "candidate_channel_sensitivity": float(sensitivity.item()),
         }
@@ -125,15 +125,35 @@ class TrainingMetricsCsvWriter(KVWriter):
         ),
     ]
 
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, append: bool = False):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._csv_path = self.log_dir / "loss_log.csv"
-        self._csv_file = open(self._csv_path, "w", newline="", encoding="utf-8")
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(
-            ["timestep"] + [column for _, column in self.METRIC_COLUMNS]
+        append_existing = (
+            append
+            and self._csv_path.is_file()
+            and self._csv_path.stat().st_size > 0
         )
+        expected_header = [
+            "timestep", *[column for _, column in self.METRIC_COLUMNS]
+        ]
+        if append_existing:
+            with self._csv_path.open(
+                encoding="utf-8", newline=""
+            ) as existing_file:
+                existing_header = next(csv.reader(existing_file), [])
+            if existing_header != expected_header:
+                raise ValueError(
+                    "Cannot append loss_log.csv with an incompatible header."
+                )
+
+        mode = "a" if append_existing else "w"
+        self._csv_file = open(
+            self._csv_path, mode, newline="", encoding="utf-8"
+        )
+        self._csv_writer = csv.writer(self._csv_file)
+        if not append_existing:
+            self._csv_writer.writerow(expected_header)
 
     def write(
         self,
@@ -162,13 +182,21 @@ class TrainingMetricsCsvWriter(KVWriter):
 class TrainingMetricsCallback(BaseCallback):
     """Attach TrainingMetricsCsvWriter after SB3 configures its logger."""
 
-    def __init__(self, log_dir: str = "./output", verbose: int = 1):
+    def __init__(
+        self,
+        log_dir: str = "./output",
+        verbose: int = 1,
+        append: bool = False,
+    ):
         super().__init__(verbose)
         self.log_dir = log_dir
+        self.append = append
         self._writer: Optional[TrainingMetricsCsvWriter] = None
 
     def _on_training_start(self) -> None:
-        self._writer = TrainingMetricsCsvWriter(self.log_dir)
+        self._writer = TrainingMetricsCsvWriter(
+            self.log_dir, append=self.append
+        )
         self.model.logger.output_formats.append(self._writer)
         if self.verbose:
             print(f"[Callback] Loss CSV 로그: {Path(self.log_dir) / 'loss_log.csv'}")
@@ -217,6 +245,7 @@ class AllocationCallback(BaseCallback):
         self,
         log_dir: str = "./output",
         verbose: int = 1,
+        append: bool = False,
     ):
         super().__init__(verbose)
         self.log_dir = Path(log_dir)
@@ -226,6 +255,7 @@ class AllocationCallback(BaseCallback):
         self._csv_path = self.log_dir / "training_log.csv"
         self._csv_file = None
         self._csv_writer = None
+        self._append = append
 
         # 에피소드 카운터
         self._episode_count = 0
@@ -248,9 +278,36 @@ class AllocationCallback(BaseCallback):
         }
 
     def _on_training_start(self):
-        self._csv_file = open(self._csv_path, "w", newline="", encoding="utf-8")
+        append_existing = (
+            self._append
+            and self._csv_path.is_file()
+            and self._csv_path.stat().st_size > 0
+        )
+        if append_existing:
+            with self._csv_path.open(
+                encoding="utf-8", newline=""
+            ) as existing_file:
+                reader = csv.DictReader(existing_file)
+                if reader.fieldnames != self.CSV_COLUMNS:
+                    raise ValueError(
+                        "Cannot append training_log.csv with an "
+                        "incompatible header."
+                    )
+                for row in reader:
+                    try:
+                        self._episode_count = max(
+                            self._episode_count, int(row["episode"])
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+        mode = "a" if append_existing else "w"
+        self._csv_file = open(
+            self._csv_path, mode, newline="", encoding="utf-8"
+        )
         self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(self.CSV_COLUMNS)
+        if not append_existing:
+            self._csv_writer.writerow(self.CSV_COLUMNS)
 
         model = getattr(self, "model", None)
         policy = getattr(model, "policy", None)

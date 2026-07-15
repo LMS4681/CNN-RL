@@ -155,6 +155,31 @@ def select_workspaces(
     return selected
 
 
+def select_workspaces_in_order(
+    workspaces: List[Workspace],
+    ordered_codes: Optional[Sequence[str]],
+) -> List[Workspace]:
+    """Select workspaces in a recorded model action-index order."""
+    if not ordered_codes:
+        return list(workspaces)
+
+    normalized = [
+        code.strip().upper()
+        for code in ordered_codes
+        if code.strip()
+    ]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("Recorded workspace codes must be unique.")
+
+    by_code = {workspace.code.upper(): workspace for workspace in workspaces}
+    unknown = [code for code in normalized if code not in by_code]
+    if unknown:
+        raise ValueError(
+            "Unknown recorded workspace code(s): " + ", ".join(unknown)
+        )
+    return [by_code[code] for code in normalized]
+
+
 def load_blocks(
     block_csv: str,
     workspaces: List[Workspace],

@@ -112,6 +112,44 @@ class TrainingVisualizationTests(unittest.TestCase):
 
         self.assertEqual([], rows)
 
+    def test_training_metrics_resume_appends_existing_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = TrainingMetricsCsvWriter(tmpdir)
+            first.write({"train/loss": 1.0}, {}, step=10)
+            first.close()
+
+            resumed = TrainingMetricsCsvWriter(tmpdir, append=True)
+            resumed.write({"train/loss": 0.5}, {}, step=20)
+            resumed.close()
+
+            with open(Path(tmpdir) / "loss_log.csv", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(["10", "20"], [row["timestep"] for row in rows])
+        self.assertEqual(["1.000000", "0.500000"], [row["loss"] for row in rows])
+
+    def test_allocation_log_resume_preserves_rows_and_episode_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "training_log.csv"
+            with path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(AllocationCallback.CSV_COLUMNS)
+                writer.writerow([7, 700, 0.1, 0.0, 0.1, 0.1, 0, 0, 0, 1.0])
+
+            callback = AllocationCallback(
+                tmpdir, verbose=0, append=True
+            )
+            callback._on_training_start()
+            episode_count = callback._episode_count
+            callback._on_training_end()
+
+            with path.open(encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(7, episode_count)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("7", rows[0]["episode"])
+
     def test_plot_training_curves_creates_quality_axes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

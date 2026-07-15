@@ -531,8 +531,64 @@ class BlockPlacementEnv(gym.Env):
             else list(block_indices)
         )
 
+        return self._future_workspace_choice_count_on(
+            indices, self._workspaces
+        )
+
+    def future_workspace_choice_count_after_action(
+        self,
+        action: int,
+        block_indices: Optional[Iterable[int]] = None,
+    ) -> int:
+        """Preview future choices immediately after one candidate placement."""
+        simulator = self._placement_simulator
+        if simulator is None or simulator.current_block is None:
+            return 0
+
+        action = int(action)
+        if not 0 <= action < self._num_workspaces:
+            raise IndexError(f"Workspace action is out of range: {action}")
+        if not self.action_masks()[action]:
+            raise ValueError(f"Workspace action is masked: {action}")
+
+        indices = (
+            self.future_workspace_choice_indices()
+            if block_indices is None
+            else list(block_indices)
+        )
+        preview_workspaces = list(self._workspaces)
+        preview_workspaces[action] = self._workspaces[action].deep_copy()
+        candidate = self._compute_candidate_placements(
+            simulator.current_block
+        )[action]
+        if candidate.position is not None:
+            placed_block = simulator.current_block.clone()
+            if candidate.rotated:
+                placed_block.turn()
+            center_x, center_y = candidate.position
+            placed_block.move(
+                center_x - placed_block.ref_x,
+                center_y - placed_block.ref_y,
+            )
+            preview_workspaces[action].add_block(
+                placed_block, self._env_date
+            )
+
+        return self._future_workspace_choice_count_on(
+            indices, preview_workspaces
+        )
+
+    def _future_workspace_choice_count_on(
+        self,
+        block_indices: Iterable[int],
+        workspaces: List[Workspace],
+    ) -> int:
+        simulator = self._placement_simulator
+        if simulator is None:
+            return 0
+
         total = 0
-        for block_index in indices:
+        for block_index in block_indices:
             if not 0 <= block_index < len(self._blocks):
                 continue
             if (
@@ -541,7 +597,7 @@ class BlockPlacementEnv(gym.Env):
             ):
                 continue
             block = self._blocks[block_index]
-            for workspace in self._workspaces:
+            for workspace in workspaces:
                 if not all(
                     constraint.is_feasible(block, workspace)
                     for constraint in self._constraints

@@ -438,7 +438,7 @@ def evaluate_model_and_export(
         apply_allowable_block_patterns,
         load_blocks,
         load_workspaces,
-        select_workspaces,
+        select_workspaces_in_order,
     )
     from alloc_env.strategy import BaseGridStrategy
     from train import create_evaluation_env
@@ -473,7 +473,7 @@ def evaluate_model_and_export(
     )
     apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(str(data_dir / "블록데이터.csv"), workspaces)
-    workspaces = select_workspaces(workspaces, active_codes)
+    workspaces = select_workspaces_in_order(workspaces, active_codes)
 
     env = create_evaluation_env(
         blocks,
