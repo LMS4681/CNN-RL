@@ -9,6 +9,11 @@ from sb3_contrib.common.maskable.utils import get_action_masks
 
 import train as train_module
 from alloc_env.block import Block
+from alloc_env.cnn_extractor import (
+    CandidateCnnExtractor,
+    FixedGridExtractor,
+    StructuredExtractor,
+)
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 
@@ -39,6 +44,29 @@ def make_workspace(code: str) -> Workspace:
 
 
 class ParallelTrainingConfigTests(unittest.TestCase):
+    def test_policy_kwargs_select_only_approved_extractors(self):
+        expected_extractors = {
+            "structured": StructuredExtractor,
+            "fixed-grid": FixedGridExtractor,
+            "candidate-cnn": CandidateCnnExtractor,
+        }
+        for name, expected in expected_extractors.items():
+            with self.subTest(extractor=name):
+                kwargs = train_module.build_policy_kwargs(
+                    name, features_dim=128
+                )
+                self.assertIs(
+                    expected, kwargs["features_extractor_class"]
+                )
+                self.assertEqual(
+                    {"features_dim": 128},
+                    kwargs["features_extractor_kwargs"],
+                )
+                self.assertTrue(kwargs["share_features_extractor"])
+
+        with self.assertRaises(ValueError):
+            train_module.build_policy_kwargs("block-attn")
+
     def test_parallel_cli_arguments_are_accepted(self):
         captured = {}
 

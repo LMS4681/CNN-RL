@@ -25,6 +25,8 @@ import numpy as np
 
 
 DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
+OBSERVATION_SCHEMA_VERSION = 2
+REWARD_SCHEMA_VERSION = 2
 
 
 def parse_workspace_codes(value: str | None) -> list[str] | None:
@@ -52,7 +54,6 @@ def mask_fn(env):
 def build_policy_kwargs(
     extractor: str = "candidate-cnn",
     features_dim: int = 256,
-    **_unused_kwargs,
 ) -> dict:
     from alloc_env.cnn_extractor import (
         CandidateCnnExtractor,
@@ -221,26 +222,24 @@ def create_evaluation_env(
 
 # 관측 공간·네트워크 구조에 영향을 주는 키. 이어학습하려면 이 값들이 모두 같아야 한다.
 ARCH_CONFIG_KEYS = (
+    "observation_schema_version",
+    "reward_schema_version",
     "extractor",
     "n_future_blocks",
     "grid_size",
     "features_dim",
-    "cnn_out_dim",
-    "extractor_embed_dim",
-    "extractor_heads",
     "active_workspace_codes",
 )
 
 
 def current_run_config(args, active_workspace_codes) -> dict:
     return {
+        "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
+        "reward_schema_version": REWARD_SCHEMA_VERSION,
         "extractor": args.extractor,
         "n_future_blocks": args.n_future_blocks,
         "grid_size": args.grid_size,
         "features_dim": args.features_dim,
-        "cnn_out_dim": args.cnn_out_dim,
-        "extractor_embed_dim": args.extractor_embed_dim,
-        "extractor_heads": args.extractor_heads,
         "active_workspace_codes": list(active_workspace_codes or []),
     }
 
@@ -410,12 +409,11 @@ def train(args):
     policy_kwargs = build_policy_kwargs(
         extractor=args.extractor,
         features_dim=args.features_dim,
-        cnn_out_dim=args.cnn_out_dim,
-        embed_dim=args.extractor_embed_dim,
-        num_heads=args.extractor_heads,
     )
     # 이어학습 경로 결정: --resume-from(명시) 우선, 없으면 --auto-resume 자동 탐지
-    run_config = current_run_config(args, active_workspace_codes)
+    run_config = current_run_config(
+        args, [workspace.code for workspace in workspaces]
+    )
     resume_path = resolve_resume_path(args, output_dir, run_config)
     is_resume = resume_path is not None
     # 현재 설정 기록 (다음 auto-resume 호환성 검사 + 크래시 후 복구용)
@@ -440,6 +438,7 @@ def train(args):
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
             gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
             policy_kwargs=policy_kwargs,
             seed=args.seed,
             device=args.device,
@@ -622,6 +621,8 @@ def main():
                         help="PPO epochs per update")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="감가율 (discount factor)")
+    parser.add_argument("--gae-lambda", type=float, default=0.98,
+                        help="GAE bias-variance parameter")
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
     parser.add_argument(
@@ -631,17 +632,10 @@ def main():
         choices=["structured", "fixed-grid", "candidate-cnn"],
         help="feature extractor ablation mode",
     )
-    parser.add_argument("--n-future-blocks", type=int, default=0,
-                        help="관측에 포함할 미래 블록 개수 (0=미포함, 기존 계약 유지). "
-                             "block-attn extractor와 함께 3~5 권장.")
+    parser.add_argument("--n-future-blocks", type=int, default=4,
+                        help="ordered future blocks included in observations")
     parser.add_argument("--features-dim", type=int, default=256,
                         help="policy feature vector dimension")
-    parser.add_argument("--cnn-out-dim", type=int, default=64,
-                        help="workspace CNN output dimension")
-    parser.add_argument("--extractor-embed-dim", type=int, default=64,
-                        help="pointer-attn token embedding dimension")
-    parser.add_argument("--extractor-heads", type=int, default=4,
-                        help="pointer-attn attention head count")
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"],
                         help="PyTorch device for policy training")

@@ -7,6 +7,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+import train as train_module
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.data_loader import load_workspaces
 from alloc_env.simulator import SimulationResult
@@ -34,6 +35,21 @@ def make_block(name: str, x: float, y: float) -> Block:
 
 
 class SafetyAndWorkspaceLimitTests(unittest.TestCase):
+    def test_checkpoint_schema_versions_must_match(self):
+        saved = {
+            key: None for key in train_module.ARCH_CONFIG_KEYS
+        }
+        current = dict(saved)
+        saved["observation_schema_version"] = 1
+        current["observation_schema_version"] = 2
+
+        compatible, bad_key = train_module.configs_compatible(
+            saved, current
+        )
+
+        self.assertFalse(compatible)
+        self.assertEqual("observation_schema_version", bad_key)
+
     def test_blocks_closer_than_safety_distance_intersect(self):
         left = make_block("A001", x=5.0, y=5.0)
         right = make_block("A002", x=15.5, y=5.0)
