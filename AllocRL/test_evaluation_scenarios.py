@@ -1,6 +1,8 @@
 import csv
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections import Counter
@@ -40,7 +42,9 @@ from evaluation_scenarios import (
 from run_ablation import (
     ABLATIONS,
     _block_source_path,
+    build_baseline_command,
     build_ablation_commands,
+    main as run_ablation_main,
     prepare_evaluation_file,
 )
 from train import (
@@ -449,6 +453,35 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertTrue(
             all("--timesteps 100000" in " ".join(c) for c in commands)
         )
+
+    def test_baseline_command_uses_the_fixed_holdout_bundle(self):
+        output = "./output_ablation/baselines/evaluation_scenarios.csv"
+
+        command = build_baseline_command(
+            scenario_path="./data/fixed_eval_scenarios.json",
+            output_path=output,
+        )
+
+        joined = subprocess.list2cmdline(command)
+        self.assertIn("evaluate_baselines.py", joined)
+        self.assertIn("fixed_eval_scenarios.json", joined)
+        self.assertIn(output, joined)
+
+    def test_evaluate_baselines_dispatches_the_list_command(self):
+        expected = build_baseline_command(
+            "./data/fixed_eval_scenarios.json",
+            "./output_ablation/baselines/evaluation_scenarios.csv",
+        )
+
+        with (
+            patch.object(
+                sys, "argv", ["run_ablation.py", "--evaluate-baselines"]
+            ),
+            patch("run_ablation.subprocess.run") as run,
+        ):
+            run_ablation_main()
+
+        run.assert_called_once_with(expected, check=True)
 
     def test_retained_choice_ratio(self):
         self.assertEqual(1.0, compute_retained_choice_ratio(0, 0))

@@ -68,6 +68,19 @@ def build_ablation_commands(
     return commands
 
 
+def build_baseline_command(
+    scenario_path: str, output_path: str
+) -> list[str]:
+    return [
+        sys.executable,
+        "evaluate_baselines.py",
+        "--scenarios",
+        scenario_path,
+        "--output",
+        output_path,
+    ]
+
+
 def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
     from alloc_env.block_generator import BlockDistribution
     from alloc_env.data_split import split_blocks_by_ship, write_split_manifest
@@ -149,6 +162,7 @@ def main() -> None:
     parser.add_argument("--seeds", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--prepare-eval-scenarios", action="store_true")
+    parser.add_argument("--evaluate-baselines", action="store_true")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument(
         "--scenario-path", default="./data/fixed_eval_scenarios.json"
@@ -163,6 +177,14 @@ def main() -> None:
             "Data split manifest saved to: "
             f"{output_path.with_name('data_split_manifest.json')}"
         )
+        return
+
+    if args.evaluate_baselines:
+        command = build_baseline_command(
+            args.scenario_path,
+            "./output_ablation/baselines/evaluation_scenarios.csv",
+        )
+        subprocess.run(command, check=True)
         return
 
     seeds = _parse_seeds(args.seeds, args.mode)

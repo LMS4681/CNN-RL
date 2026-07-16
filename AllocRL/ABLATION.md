@@ -1,5 +1,31 @@
 # AllocRL A-E Ablation
 
+## Stage A Fixed-Holdout Protocol
+
+Stage A uses the schema-3 fixed holdout bundle at
+`data/fixed_eval_scenarios.json`. The source contains 913 rows from 40 ships.
+The ship-level split produces 673 training rows from 29 ships and 240 holdout
+rows from 11 ships. Its fixed seed is `20260716`: a ship is held out when the
+first eight bytes of `SHA-256("20260716:<ship_no>")`, interpreted as an
+unsigned big-endian integer and divided by `2**64`, are below `0.20`.
+
+The original allocation CSV has a one-shot business-reference evaluation role;
+it is not a regenerated reporting set. Stage A reporting uses the 20 fixed
+holdout scenarios with seeds `1000..1019`. Stage A does not select a
+checkpoint from those scenarios.
+
+The required baseline command evaluates exactly `RandomValidPolicy` seeded by
+each scenario seed and `GreedyImmediateAreaPolicy`, through the shared
+evaluation runner:
+
+```powershell
+py -B run_ablation.py --evaluate-baselines
+```
+
+It writes `output_ablation/baselines/evaluation_scenarios.csv` with one detail
+row per policy and scenario. No Stage-A result may claim CNN improvement: the
+observation correction remains pending in Stage B.
+
 이 실험은 같은 학습 예산과 같은 고정 평가 시나리오에서 미래 블록 정보와
 후보 배치 CNN의 효과를 분리해 비교합니다.
 
