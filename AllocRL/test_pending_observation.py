@@ -1,11 +1,105 @@
 import unittest
 from datetime import date
 
+import numpy as np
+import pytest
+
+from alloc_env import calendar as cal
 from alloc_env.block import Block
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
+from alloc_env.observation_state import (
+    ObservationScales,
+    build_observation_scales,
+    build_observation_space,
+    encode_current_block,
+    encode_future_blocks,
+    encode_future_demand,
+    encode_pending_queues,
+    working_day_position,
+    working_days_until,
+)
 from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
+
+
+def add_workdays(start: date, count: int) -> date:
+    value = start
+    for _index in range(count):
+        value = cal.next_working_day(value)
+    return value
+
+
+def make_scales(**overrides) -> ObservationScales:
+    values = {
+        "max_length": 10.0,
+        "max_breadth": 5.0,
+        "max_duration": 10,
+        "base_date": date(2026, 1, 5),
+        "date_span_workdays": 100,
+        "max_workspace_area": 5_000.0,
+        "total_workspace_area": 50_000.0,
+        "max_workspace_length": 100.0,
+        "max_workspace_breadth": 50.0,
+        "dropout_threshold": 7,
+    }
+    values.update(overrides)
+    return ObservationScales(**values)
+
+
+def make_observation_fixture(block_count: int = 40) -> dict:
+    base = date(2026, 1, 5)
+    blocks = [
+        Block(
+            name=f"B-{index}", ship_no="S-1", block_type="BUILD",
+            length=10.0, breadth=5.0, height=1.0, weight=1.0,
+            in_date=add_workdays(base, index),
+            out_date=add_workdays(base, index + 9),
+        )
+        for index in range(block_count)
+    ]
+    workspaces = [
+        Workspace(
+            code=f"W-{index}", origin_x=0.0, origin_y=0.0,
+            length=100.0, breadth=50.0,
+            strategy=BaseGridStrategy(step=1.0),
+        )
+        for index in range(10)
+    ]
+    simulator = IncrementalPlacementSimulator(blocks, workspaces, 7)
+    return {
+        "blocks": simulator.blocks,
+        "workspaces": simulator.workspaces,
+        "simulator": simulator,
+        "env_date": simulator.env_date,
+        "scales": make_scales(),
+    }
+
+
+def build_structured_state(fixture: dict) -> dict[str, np.ndarray]:
+    simulator = fixture["simulator"]
+    indices = simulator.unassigned_block_indices()
+    future_blocks, future_mask = encode_future_blocks(
+        fixture["blocks"], indices, fixture["env_date"], fixture["scales"]
+    )
+    pending_blocks, pending_mask, pending_summary = encode_pending_queues(
+        fixture["blocks"], fixture["workspaces"], simulator,
+        fixture["scales"],
+    )
+    return {
+        "block": encode_current_block(
+            simulator.current_block, fixture["env_date"],
+            simulator.assigned_count, fixture["scales"],
+        ),
+        "future_blocks": future_blocks,
+        "future_mask": future_mask,
+        "future_demand": encode_future_demand(
+            fixture["blocks"], indices, fixture["env_date"], fixture["scales"]
+        ),
+        "pending_blocks": pending_blocks,
+        "pending_mask": pending_mask,
+        "pending_summary": pending_summary,
+    }
 
 
 def make_queue_simulator(block_count: int = 4) -> IncrementalPlacementSimulator:
@@ -88,6 +182,305 @@ class PendingAssignmentIndicesTests(unittest.TestCase):
         simulator.assignments[0] = 1
 
         self.assertEqual(simulator.pending_assignment_indices(99), [])
+
+
+def test_schema3_observation_space_has_complete_exact_contract():
+    space = build_observation_space(n_workspaces=3, grid_size=8)
+
+    assert list(space.spaces) == [
+        "block",
+        "future_blocks",
+        "future_demand",
+        "future_mask",
+        "grids",
+        "pending_blocks",
+        "pending_mask",
+        "pending_summary",
+        "ws_meta",
+    ]
+    expected_shapes = {
+        "block": (8,),
+        "grids": (3, 4, 8, 8),
+        "ws_meta": (3, 4),
+        "future_blocks": (16, 6),
+        "future_mask": (16,),
+        "future_demand": (3, 4),
+        "pending_blocks": (3, 32, 7),
+        "pending_mask": (3, 32),
+        "pending_summary": (3, 4),
+    }
+    assert {key: value.shape for key, value in space.spaces.items()} == expected_shapes
+    assert all(value.dtype == np.dtype(np.float32) for value in space.spaces.values())
+    assert all(np.all(value.low == 0.0) for value in space.spaces.values())
+    assert all(np.all(value.high == 1.0) for value in space.spaces.values())
+
+
+@pytest.mark.parametrize(
+    ("n_workspaces", "grid_size", "message"),
+    [(0, 64, "workspace"), (10, 0, "grid_size")],
+)
+def test_schema3_observation_space_rejects_nonpositive_dimensions(
+    n_workspaces, grid_size, message
+):
+    with pytest.raises(ValueError, match=message):
+        build_observation_space(n_workspaces=n_workspaces, grid_size=grid_size)
+
+
+def test_working_day_helpers_exclude_weekends_and_count_positions():
+    friday = date(2026, 1, 9)
+    saturday = date(2026, 1, 10)
+    monday = date(2026, 1, 12)
+
+    assert working_days_until(friday, saturday) == 0
+    assert working_days_until(friday, monday) == 1
+    assert working_day_position(friday, monday) == 1
+    assert working_days_until(monday, friday) == 0
+
+
+def test_observation_scales_round_trip_is_deterministic_and_does_not_mutate_input():
+    scales = make_scales()
+    expected_keys = [
+        "max_length",
+        "max_breadth",
+        "max_duration",
+        "base_date",
+        "date_span_workdays",
+        "max_workspace_area",
+        "total_workspace_area",
+        "max_workspace_length",
+        "max_workspace_breadth",
+        "dropout_threshold",
+    ]
+
+    serialized = scales.to_dict()
+    original = dict(serialized)
+
+    assert list(serialized) == expected_keys
+    assert serialized["base_date"] == "2026-01-05"
+    assert ObservationScales.from_dict(serialized) == scales
+    assert serialized == original
+    assert scales.to_dict() == serialized
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_length",
+        "max_breadth",
+        "max_duration",
+        "date_span_workdays",
+        "max_workspace_area",
+        "total_workspace_area",
+        "max_workspace_length",
+        "max_workspace_breadth",
+        "dropout_threshold",
+    ],
+)
+def test_observation_scales_reject_zero_normalization_denominators(field):
+    with pytest.raises(ValueError, match=field):
+        make_scales(**{field: 0})
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -1.0])
+def test_observation_scales_reject_nonfinite_or_negative_scales(invalid):
+    with pytest.raises(ValueError, match="max_length"):
+        make_scales(max_length=invalid)
+
+
+def test_build_observation_scales_uses_complete_source_and_working_days():
+    base = date(2026, 1, 5)
+    small = Block(
+        name="small", ship_no="S-1", block_type="BUILD",
+        length=4.0, breadth=3.0, height=1.0, weight=1.0,
+        in_date=base, out_date=add_workdays(base, 4),
+    )
+    late = Block(
+        name="late", ship_no="S-1", block_type="BUILD",
+        length=12.0, breadth=7.0, height=1.0, weight=1.0,
+        in_date=add_workdays(base, 5), out_date=add_workdays(base, 14),
+    )
+    source_blocks = [small] * 912 + [late]
+    workspaces = [
+        Workspace(
+            code=f"W-{index}", origin_x=0.0, origin_y=0.0,
+            length=10.0 * (index + 1), breadth=20.0 * (index + 1),
+            strategy=BaseGridStrategy(step=1.0),
+        )
+        for index in range(10)
+    ]
+
+    scales = build_observation_scales(source_blocks, workspaces, 7)
+
+    assert scales.max_length == 12.0
+    assert scales.max_breadth == 7.0
+    assert scales.max_duration == 10
+    assert scales.base_date == base
+    assert scales.date_span_workdays == 5
+    assert scales.max_workspace_area == 20_000.0
+    assert scales.total_workspace_area == 77_000.0
+    assert scales.max_workspace_length == 100.0
+    assert scales.max_workspace_breadth == 200.0
+    assert scales.dropout_threshold == 7
+
+
+@pytest.mark.parametrize("block_count", [912, 914])
+def test_build_observation_scales_requires_exact_block_cardinality(block_count):
+    simulator = make_queue_simulator()
+
+    with pytest.raises(ValueError, match="913"):
+        build_observation_scales(
+            [simulator.blocks[0]] * block_count,
+            [simulator.workspaces[0]] * 10,
+            7,
+        )
+
+
+@pytest.mark.parametrize("workspace_count", [9, 11])
+def test_build_observation_scales_requires_exact_workspace_cardinality(
+    workspace_count,
+):
+    simulator = make_queue_simulator()
+
+    with pytest.raises(ValueError, match="10"):
+        build_observation_scales(
+            [simulator.blocks[0]] * 913,
+            [simulator.workspaces[0]] * workspace_count,
+            7,
+        )
+
+
+def test_build_observation_scales_allows_explicit_focused_fixture_opt_out():
+    simulator = make_queue_simulator()
+
+    scales = build_observation_scales(
+        simulator.blocks,
+        simulator.workspaces,
+        7,
+        require_full_source=False,
+    )
+
+    assert scales.max_length == 5.0
+    assert scales.max_workspace_area == 10_000.0
+
+
+def test_schema3_structured_shapes_ranges_and_initial_zero_pending_state():
+    state = build_structured_state(make_observation_fixture())
+
+    assert state["block"].shape == (8,)
+    assert state["future_blocks"].shape == (16, 6)
+    assert state["future_mask"].shape == (16,)
+    assert state["future_demand"].shape == (3, 4)
+    assert state["pending_blocks"].shape == (10, 32, 7)
+    assert state["pending_mask"].shape == (10, 32)
+    assert state["pending_summary"].shape == (10, 4)
+    assert all(value.dtype == np.float32 for value in state.values())
+    assert all(
+        np.all((0.0 <= value) & (value <= 1.0))
+        for value in state.values()
+    )
+    assert np.count_nonzero(state["pending_blocks"]) == 0
+    assert np.count_nonzero(state["pending_mask"]) == 0
+    assert np.count_nonzero(state["pending_summary"]) == 0
+
+
+def test_pending_rows_follow_simulator_queue_order_and_exact_feature_order():
+    simulator = make_queue_simulator()
+    simulator.current_block_index = None
+    simulator.assignments[:] = [1, 0, 1, None]
+    simulator.blocks[0].delay_placement(2)
+    simulator.blocks[2].delay_placement(1)
+    before_blocks = [vars(block).copy() for block in simulator.blocks]
+    before_assignments = list(simulator.assignments)
+    before_pending = set(simulator.pending)
+
+    blocks, mask, summary = encode_pending_queues(
+        simulator.blocks, simulator.workspaces, simulator, make_scales()
+    )
+
+    assert simulator.pending_assignment_indices(1) == [0, 2]
+    np.testing.assert_allclose(
+        blocks[1, 0],
+        np.array([0.5, 1.0, 1.0, 2 / 7, 1.0, 0.0025, 0.05], np.float32),
+    )
+    np.testing.assert_allclose(
+        blocks[1, 1],
+        np.array([0.5, 1.0, 1.0, 1 / 7, 1.0, 0.0025, 0.05], np.float32),
+    )
+    np.testing.assert_array_equal(mask[1, :2], np.ones(2, np.float32))
+    assert np.count_nonzero(blocks[1, 2:]) == 0
+    assert np.count_nonzero(mask[1, 2:]) == 0
+    np.testing.assert_allclose(
+        summary[1],
+        np.array([2 / 913, 50 / 40_000, 2 / 7, 0.0], np.float32),
+    )
+    assert [vars(block) for block in simulator.blocks] == before_blocks
+    assert simulator.assignments == before_assignments
+    assert simulator.pending == before_pending
+
+
+def test_pending_overflow_keeps_first_32_and_summarizes_complete_queue():
+    fixture = make_observation_fixture(block_count=35)
+    simulator = fixture["simulator"]
+    simulator.current_block_index = None
+    simulator.assignments = [0] * 35
+    for index, block in enumerate(fixture["blocks"]):
+        block.length = float(index + 1)
+        block.breadth = 1.0
+    scales = make_scales(max_length=40.0, max_breadth=1.0)
+
+    blocks, mask, summary = encode_pending_queues(
+        fixture["blocks"], fixture["workspaces"], simulator,
+        scales,
+    )
+
+    assert mask[0].sum() == 32
+    np.testing.assert_allclose(
+        blocks[0, :, 0], np.arange(1, 33, dtype=np.float32) / 40
+    )
+    assert summary[0, 0] == pytest.approx(35 / 913)
+    assert summary[0, 1] == pytest.approx(630 / 20_000)
+    assert summary[0, 2] == 0.0
+    assert summary[0, 3] == pytest.approx(3 / 913)
+    assert np.count_nonzero(blocks[1:]) == 0
+    assert np.count_nonzero(mask[1:]) == 0
+    assert np.count_nonzero(summary[1:]) == 0
+
+
+def test_delayed_assigned_block_updates_pending_features_before_resolution():
+    fixture = make_observation_fixture(block_count=2)
+    simulator = fixture["simulator"]
+    simulator.assignments[0] = 0
+    simulator.current_block_index = 1
+
+    before, before_mask, _summary = encode_pending_queues(
+        fixture["blocks"], fixture["workspaces"], simulator,
+        fixture["scales"],
+    )
+    fixture["blocks"][0].delay_placement(1)
+    after, after_mask, _summary = encode_pending_queues(
+        fixture["blocks"], fixture["workspaces"], simulator,
+        fixture["scales"],
+    )
+
+    assert before_mask[0, 0] == after_mask[0, 0] == 1.0
+    assert before[0, 0, 3] == 0.0
+    assert after[0, 0, 3] == pytest.approx(1 / 7)
+    assert simulator.delay_days[0] is None
+    assert 0 in simulator.pending
+
+
+def test_pending_encoder_rejects_zero_workspace_denominator():
+    fixture = make_observation_fixture(block_count=2)
+    simulator = fixture["simulator"]
+    simulator.assignments[0] = 0
+    simulator.current_block_index = 1
+    fixture["workspaces"][0].length = 0.0
+
+    with pytest.raises(ValueError, match="workspace dimensions"):
+        encode_pending_queues(
+            fixture["blocks"], fixture["workspaces"], simulator,
+            fixture["scales"],
+        )
 
 
 if __name__ == "__main__":

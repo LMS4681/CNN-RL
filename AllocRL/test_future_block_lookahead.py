@@ -10,10 +10,62 @@ test_feature_extractors.py (torch/gym 필요) 참고.
 import unittest
 from datetime import date
 
+import numpy as np
+import pytest
+
+from alloc_env import calendar as cal
 from alloc_env.block import Block
-from alloc_env.workspace import Workspace
-from alloc_env.strategy import BaseGridStrategy
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
+from alloc_env.observation_state import (
+    ObservationScales,
+    encode_current_block,
+    encode_future_blocks,
+    encode_future_demand,
+)
+from alloc_env.strategy import BaseGridStrategy
+from alloc_env.workspace import Workspace
+
+
+def add_workdays(start: date, count: int) -> date:
+    value = start
+    for _index in range(count):
+        value = cal.next_working_day(value)
+    return value
+
+
+def make_encoder_scales() -> ObservationScales:
+    return ObservationScales(
+        max_length=10.0,
+        max_breadth=5.0,
+        max_duration=10,
+        base_date=date(2026, 1, 5),
+        date_span_workdays=100,
+        max_workspace_area=5_000.0,
+        total_workspace_area=50_000.0,
+        max_workspace_length=100.0,
+        max_workspace_breadth=50.0,
+        dropout_threshold=7,
+    )
+
+
+def make_encoder_block(
+    index: int,
+    in_date: date,
+    *,
+    length: float = 10.0,
+    breadth: float = 5.0,
+) -> Block:
+    return Block(
+        name=f"E-{index}",
+        ship_no="S-1",
+        block_type="BUILD",
+        length=length,
+        breadth=breadth,
+        height=1.0,
+        weight=1.0,
+        in_date=in_date,
+        out_date=add_workdays(in_date, 9),
+    )
 
 
 def make_block(name: str, in_date: date) -> Block:
@@ -158,6 +210,118 @@ class UpcomingBlockIndicesTests(unittest.TestCase):
         sim.current_block_index = None
 
         self.assertEqual(sim.unassigned_block_indices(), [0, 1, 2])
+
+
+def test_current_block_feature_order_and_normalizers_are_exact():
+    scales = make_encoder_scales()
+    block = make_encoder_block(0, scales.base_date)
+    env_date = add_workdays(scales.base_date, 50)
+
+    encoded = encode_current_block(block, env_date, 456, scales)
+
+    np.testing.assert_allclose(
+        encoded,
+        np.array([1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.01, 0.1], np.float32),
+    )
+    assert encoded.shape == (8,)
+    assert encoded.dtype == np.float32
+
+
+def test_current_block_clips_every_feature_and_does_not_mutate_block():
+    scales = make_encoder_scales()
+    block = make_encoder_block(
+        0, scales.base_date, length=20.0, breadth=0.0
+    )
+    before = vars(block).copy()
+
+    encoded = encode_current_block(block, scales.base_date, -1, scales)
+
+    assert np.all((0.0 <= encoded) & (encoded <= 1.0))
+    assert encoded[0] == 1.0
+    assert encoded[1] == 0.0
+    assert encoded[4] == 0.0
+    assert encoded[5] == 0.0
+    assert vars(block) == before
+
+
+def test_future_blocks_preserve_passed_order_mask_and_zero_padding():
+    base = date(2026, 1, 5)
+    scales = make_encoder_scales()
+    blocks = [
+        make_encoder_block(0, add_workdays(base, 1), length=2.0, breadth=1.0),
+        make_encoder_block(1, add_workdays(base, 8), length=4.0, breadth=2.0),
+        make_encoder_block(2, add_workdays(base, 15), length=6.0, breadth=3.0),
+    ]
+    indices = [2, 0]
+    before_blocks = [vars(block).copy() for block in blocks]
+    before_indices = list(indices)
+
+    encoded, mask = encode_future_blocks(blocks, indices, base, scales)
+
+    np.testing.assert_allclose(
+        encoded[0],
+        np.array([0.6, 0.6, 1.0, 0.5, 0.5, 0.0036], np.float32),
+    )
+    np.testing.assert_allclose(
+        encoded[1],
+        np.array([0.2, 0.2, 1.0, 1 / 30, 0.5, 0.0004], np.float32),
+    )
+    np.testing.assert_array_equal(mask[:2], np.ones(2, np.float32))
+    assert np.count_nonzero(encoded[2:]) == 0
+    assert np.count_nonzero(mask[2:]) == 0
+    assert encoded.shape == (16, 6)
+    assert mask.shape == (16,)
+    assert encoded.dtype == mask.dtype == np.float32
+    assert [vars(block) for block in blocks] == before_blocks
+    assert indices == before_indices
+
+
+def test_future_blocks_truncate_to_first_16_indices():
+    base = date(2026, 1, 5)
+    blocks = [make_encoder_block(i, base) for i in range(20)]
+
+    encoded, mask = encode_future_blocks(
+        blocks, list(range(19, -1, -1)), base, make_encoder_scales()
+    )
+
+    assert mask.sum() == 16
+    assert encoded[0, 0] == pytest.approx(blocks[19].length / 10.0)
+
+
+def test_future_working_day_windows_include_exact_boundaries():
+    base = date(2026, 1, 5)
+    arrivals = [0, 5, 6, 20, 21, 60, 61]
+    blocks = [
+        make_encoder_block(index, add_workdays(base, offset))
+        for index, offset in enumerate(arrivals)
+    ]
+    before = [vars(block).copy() for block in blocks]
+
+    demand = encode_future_demand(
+        blocks, list(range(len(blocks))), base, make_encoder_scales()
+    )
+
+    expected_row = np.array([2 / 913, 100 / 200_000, 1.0, 0.01], np.float32)
+    np.testing.assert_allclose(demand, np.tile(expected_row, (3, 1)))
+    assert demand.shape == (3, 4)
+    assert demand.dtype == np.float32
+    assert [vars(block) for block in blocks] == before
+
+
+def test_future_demand_empty_windows_are_zero_and_uses_only_passed_indices():
+    base = date(2026, 1, 5)
+    blocks = [
+        make_encoder_block(0, add_workdays(base, 2)),
+        make_encoder_block(1, add_workdays(base, 10)),
+        make_encoder_block(2, add_workdays(base, 30)),
+    ]
+
+    demand = encode_future_demand(blocks, [1], base, make_encoder_scales())
+
+    assert np.count_nonzero(demand[0]) == 0
+    assert demand[1, 0] == pytest.approx(1 / 913)
+    assert np.count_nonzero(demand[2]) == 0
+    assert np.all((0.0 <= demand) & (demand <= 1.0))
 
 
 if __name__ == "__main__":
