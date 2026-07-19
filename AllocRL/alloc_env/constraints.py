@@ -25,15 +25,13 @@ class HardConstraint(Protocol):
 class DimensionConstraint:
     """
     블록의 물리적 치수가 작업장의 허용 한계를 초과하는지 판정.
-    - 크기: 90° 회전 허용
+    - 크기: 원래 방향의 길이/폭 유지
     - 폭/무게/높이: 작업장 max 대비
     """
 
     def is_feasible(self, block: Block, ws: Workspace) -> bool:
-        # ① 작업장 레이아웃 크기 (90° 회전 허용)
-        no_rot = block.length <= ws.length and block.breadth <= ws.breadth
-        rot90  = block.breadth <= ws.length and block.length  <= ws.breadth
-        if not no_rot and not rot90:
+        # ① 작업장 레이아웃 크기
+        if block.length > ws.length or block.breadth > ws.breadth:
             return False
 
         # ② 폭 제약

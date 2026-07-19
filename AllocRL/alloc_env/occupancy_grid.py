@@ -35,7 +35,6 @@ class CandidatePlacement:
     position: Optional[Tuple[float, float]]
     length: float
     breadth: float
-    rotated: bool
 
     @property
     def placeable(self) -> bool:

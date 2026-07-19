@@ -107,21 +107,164 @@ class CandidateObservationTests(unittest.TestCase):
         self.assertEqual(0.0, float(obs["grids"][0, 3].sum()))
         self.assertEqual(0.0, float(obs["ws_meta"][0, 2]))
 
-    def test_rotated_candidate_uses_rotated_dimensions(self):
-        env = make_env(
-            block_length=20.0,
-            block_breadth=30.0,
-            workspace_length=30.0,
-            workspace_breadth=20.0,
-        )
+    def test_candidate_contract_has_only_original_dimensions(self):
+        env = make_env(block_length=20.0, block_breadth=10.0)
         obs, _ = env.reset(seed=3)
         candidate = env._candidate_placements[0]
         mask = obs["grids"][0, 3]
         rows, columns = np.where(mask > 0.0)
 
-        self.assertTrue(candidate.rotated)
-        self.assertEqual((30.0, 20.0), (candidate.length, candidate.breadth))
+        self.assertFalse(hasattr(candidate, "rotated"))
+        self.assertEqual((20.0, 10.0), (candidate.length, candidate.breadth))
         self.assertGreater(np.unique(columns).size, np.unique(rows).size)
+
+    def test_action_preview_does_not_turn_current_block(self):
+        strategy = BaseGridStrategy(step=1.0)
+        workspace = Workspace(
+            code="NARROW_GAP",
+            origin_x=0.0,
+            origin_y=0.0,
+            length=10.0,
+            breadth=10.0,
+            strategy=strategy,
+        )
+        workspace.add_pre_placement(
+            PrePlacedBlock(
+                label="RIGHT_STRIP",
+                pos_x=8.0,
+                pos_y=5.0,
+                length=4.0,
+                breadth=10.0,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 2, 28),
+            )
+        )
+        current = Block(
+            name="CURRENT",
+            ship_no="T001",
+            block_type="BUILD",
+            length=8.0,
+            breadth=4.0,
+            height=5.0,
+            weight=10.0,
+            in_date=date(2026, 1, 5),
+            out_date=date(2026, 1, 30),
+        )
+        future = Block(
+            name="FUTURE",
+            ship_no="T001",
+            block_type="BUILD",
+            length=4.0,
+            breadth=8.0,
+            height=5.0,
+            weight=10.0,
+            in_date=date(2026, 1, 6),
+            out_date=date(2026, 1, 30),
+        )
+        env = BlockPlacementEnv(
+            [current, future], [workspace], strategy, n_future_blocks=1
+        )
+        env.reset(seed=0)
+        future_indices = env.future_workspace_choice_indices()
+        current_state = (
+            env._placement_simulator.current_block.length,
+            env._placement_simulator.current_block.breadth,
+            env._placement_simulator.current_block.angle,
+        )
+
+        after = env.future_workspace_choice_count_after_action(
+            0, future_indices
+        )
+
+        self.assertEqual(1, after)
+        self.assertEqual(
+            current_state,
+            (
+                env._placement_simulator.current_block.length,
+                env._placement_simulator.current_block.breadth,
+                env._placement_simulator.current_block.angle,
+            ),
+        )
+        self.assertEqual(0, len(env._workspaces[0].blocks))
+
+    def test_action_preview_does_not_turn_future_block(self):
+        strategy = BaseGridStrategy(step=1.0)
+        current = Block(
+            name="CURRENT",
+            ship_no="T001",
+            block_type="BUILD",
+            length=2.0,
+            breadth=2.0,
+            height=5.0,
+            weight=10.0,
+            in_date=date(2026, 1, 5),
+            out_date=date(2026, 1, 30),
+        )
+        future = Block(
+            name="FUTURE",
+            ship_no="T001",
+            block_type="BUILD",
+            length=8.0,
+            breadth=4.0,
+            height=5.0,
+            weight=10.0,
+            in_date=date(2026, 1, 6),
+            out_date=date(2026, 1, 30),
+        )
+        rotation_only_workspace = Workspace(
+            code="ROTATION_ONLY",
+            origin_x=0.0,
+            origin_y=0.0,
+            length=10.0,
+            breadth=10.0,
+            strategy=strategy,
+        )
+        rotation_only_workspace.add_pre_placement(
+            PrePlacedBlock(
+                label="RIGHT_STRIP",
+                pos_x=8.0,
+                pos_y=5.0,
+                length=4.0,
+                breadth=10.0,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 2, 28),
+            )
+        )
+        workspaces = [
+            Workspace(
+                code="CURRENT_ONLY",
+                origin_x=0.0,
+                origin_y=0.0,
+                length=2.0,
+                breadth=2.0,
+                strategy=strategy,
+            ),
+            rotation_only_workspace,
+        ]
+        env = BlockPlacementEnv(
+            [current, future], workspaces, strategy, n_future_blocks=1
+        )
+        env.reset(seed=0)
+        future_indices = env.future_workspace_choice_indices()
+        future_state = (
+            env._blocks[future_indices[0]].length,
+            env._blocks[future_indices[0]].breadth,
+            env._blocks[future_indices[0]].angle,
+        )
+
+        after = env.future_workspace_choice_count_after_action(
+            0, future_indices
+        )
+
+        self.assertEqual(0, after)
+        self.assertEqual(
+            future_state,
+            (
+                env._blocks[future_indices[0]].length,
+                env._blocks[future_indices[0]].breadth,
+                env._blocks[future_indices[0]].angle,
+            ),
+        )
 
 
 if __name__ == "__main__":

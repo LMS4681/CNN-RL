@@ -94,14 +94,8 @@ class PlacementSimulator:
                     resolved.append(idx)
                     continue
 
-                pos = ws.determine_placement_position(blk, env_date)
-
-                # 실패 시 90° 회전 재시도
-                if pos is None:
-                    blk.turn()
-                    pos = ws.determine_placement_position(blk, env_date)
-                    if pos is None:
-                        blk.turn()  # 원래 방향으로 복원
+                trial = blk.clone()
+                pos = ws.determine_placement_position(trial, env_date)
 
                 if pos is not None:
                     cx, cy = pos

@@ -28,7 +28,7 @@ class IncrementalPlacementSimulator:
     """
     Date-driven simulator that requests workspace assignments just-in-time.
 
-    It uses the same placement, rotation, delay, and dropout rules as
+    It uses the same placement, delay, and dropout rules as
     PlacementSimulator.replay(), but exposes one decision point at a time.
     """
 
@@ -229,13 +229,8 @@ class IncrementalPlacementSimulator:
             )
 
         workspace = self.workspaces[assignment]
-        pos = workspace.determine_placement_position(block, self.env_date)
-
-        if pos is None:
-            block.turn()
-            pos = workspace.determine_placement_position(block, self.env_date)
-            if pos is None:
-                block.turn()
+        trial = block.clone()
+        pos = workspace.determine_placement_position(trial, self.env_date)
 
         if pos is not None:
             cx, cy = pos

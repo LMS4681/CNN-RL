@@ -591,14 +591,12 @@ class BlockPlacementEnv(gym.Env):
         )
         preview_workspaces = list(self._workspaces)
         preview_workspaces[action] = self._workspaces[action].deep_copy()
-        candidate = self._compute_candidate_placements(
-            simulator.current_block
-        )[action]
-        if candidate.position is not None:
-            placed_block = simulator.current_block.clone()
-            if candidate.rotated:
-                placed_block.turn()
-            center_x, center_y = candidate.position
+        placed_block = simulator.current_block.clone()
+        position = preview_workspaces[action].determine_placement_position(
+            placed_block, self._env_date
+        )
+        if position is not None:
+            center_x, center_y = position
             placed_block.move(
                 center_x - placed_block.ref_x,
                 center_y - placed_block.ref_y,
@@ -640,11 +638,6 @@ class BlockPlacementEnv(gym.Env):
                 position = workspace.determine_placement_position(
                     trial, self._env_date
                 )
-                if position is None:
-                    trial.turn()
-                    position = workspace.determine_placement_position(
-                        trial, self._env_date
-                    )
                 total += int(position is not None)
         return total
 
@@ -724,9 +717,7 @@ class BlockPlacementEnv(gym.Env):
         for allowed, workspace in zip(hard_mask, self._workspaces):
             if not allowed:
                 candidates.append(
-                    CandidatePlacement(
-                        None, blk.length, blk.breadth, rotated=False
-                    )
+                    CandidatePlacement(None, blk.length, blk.breadth)
                 )
                 continue
 
@@ -734,20 +725,12 @@ class BlockPlacementEnv(gym.Env):
             position = workspace.determine_placement_position(
                 trial, self._env_date
             )
-            rotated = False
-            if position is None:
-                trial.turn()
-                rotated = True
-                position = workspace.determine_placement_position(
-                    trial, self._env_date
-                )
 
             candidates.append(
                 CandidatePlacement(
                     position,
-                    trial.length,
-                    trial.breadth,
-                    rotated=rotated if position is not None else False,
+                    blk.length,
+                    blk.breadth,
                 )
             )
         return candidates
