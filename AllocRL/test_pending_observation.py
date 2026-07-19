@@ -3,6 +3,7 @@ from datetime import date
 
 from alloc_env.block import Block
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
+from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 
@@ -60,6 +61,33 @@ class PendingAssignmentIndicesTests(unittest.TestCase):
         simulator.blocks[0].in_date = date(2026, 1, 2)
 
         self.assertEqual(simulator.current_delay_workdays(0), 0)
+
+    def test_current_delay_rejects_negative_block_index(self):
+        simulator = make_queue_simulator()
+
+        with self.assertRaisesRegex(IndexError, "block index"):
+            simulator.current_delay_workdays(-1)
+
+    def test_current_delay_rejects_upper_out_of_range_block_index(self):
+        simulator = make_queue_simulator()
+
+        with self.assertRaisesRegex(IndexError, "block index"):
+            simulator.current_delay_workdays(len(simulator.blocks))
+
+    def test_pending_assignments_exclude_non_pending_and_resolved_blocks(self):
+        simulator = make_queue_simulator()
+        simulator.assignments[:] = [1, 1, 1, 1]
+        simulator.pending = {0, 1, 2}
+        simulator.delay_days[1] = 0
+        simulator.delay_days[2] = SimulationResult.DROPOUT
+
+        self.assertEqual(simulator.pending_assignment_indices(), [0])
+
+    def test_unknown_workspace_filter_returns_empty_list(self):
+        simulator = make_queue_simulator()
+        simulator.assignments[0] = 1
+
+        self.assertEqual(simulator.pending_assignment_indices(99), [])
 
 
 if __name__ == "__main__":

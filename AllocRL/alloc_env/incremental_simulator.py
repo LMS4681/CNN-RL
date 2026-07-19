@@ -136,6 +136,8 @@ class IncrementalPlacementSimulator:
         return [d for d in self.delay_days if d is not None]
 
     def current_delay_workdays(self, block_index: int) -> int:
+        if not 0 <= block_index < len(self.blocks):
+            raise IndexError(f"block index {block_index} is out of range")
         return max(
             cal.get_working_days_between(
                 self._original_blocks[block_index].in_date,

@@ -130,6 +130,35 @@ class UpcomingBlockIndicesTests(unittest.TestCase):
         sim.assign_current(0)
         self.assertEqual(sim.current_block_index, 1)
 
+    def test_equal_delays_order_by_original_in_date_then_block_index(self):
+        sim = self._make_sim([
+            date(2026, 4, 8),
+            date(2026, 4, 6),
+            date(2026, 4, 6),
+        ])
+        sim.current_block_index = None
+        sim.pending = {0, 1, 2}
+        for index in sim.pending:
+            sim.blocks[index].delay_placement(1)
+
+        self.assertEqual(sim.unassigned_block_indices(), [1, 2, 0])
+
+    def test_greater_delay_outranks_earlier_original_in_date(self):
+        sim = self._make_sim([
+            date(2026, 4, 6),
+            date(2026, 4, 8),
+        ])
+        sim.current_block_index = None
+        sim.blocks[1].delay_placement(2)
+
+        self.assertEqual(sim.unassigned_block_indices(), [1, 0])
+
+    def test_none_current_block_index_excludes_no_pending_block(self):
+        sim = self._make_sim([date(2026, 4, 6)] * 3)
+        sim.current_block_index = None
+
+        self.assertEqual(sim.unassigned_block_indices(), [0, 1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
