@@ -4,6 +4,7 @@ from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
 from alloc_env.constraints import DimensionConstraint
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
+from alloc_env.observation_state import ObservationScales
 from alloc_env.simulator import PlacementSimulator, SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
@@ -51,6 +52,18 @@ def test_candidate_does_not_rotate_to_find_a_position():
             make_workspace("VALID", 20.0, 20.0),
         ],
         strategy,
+        observation_scales=ObservationScales(
+            max_length=8.0,
+            max_breadth=4.0,
+            max_duration=12,
+            base_date=date(2026, 1, 1),
+            date_span_workdays=10,
+            max_workspace_area=400.0,
+            total_workspace_area=450.0,
+            max_workspace_length=20.0,
+            max_workspace_breadth=20.0,
+            dropout_threshold=7,
+        ),
         grid_size=64,
     )
     env.reset(seed=0)

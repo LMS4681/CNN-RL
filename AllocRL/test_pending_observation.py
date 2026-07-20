@@ -110,6 +110,21 @@ def make_ten_workspace_env(
     )
 
 
+class FixedEpisodeGenerator:
+    def __init__(self, blocks, workspaces=None):
+        self._blocks = blocks
+        self._workspaces = workspaces
+
+    def generate(self, n_blocks, base_date, spread_days=90):
+        del n_blocks, base_date, spread_days
+        return [block.clone() for block in self._blocks]
+
+    def generate_workspaces(self, original_workspaces):
+        if self._workspaces is None:
+            return Workspace.deep_copy_list(original_workspaces)
+        return Workspace.deep_copy_list(self._workspaces)
+
+
 def build_structured_state(fixture: dict) -> dict[str, np.ndarray]:
     simulator = fixture["simulator"]
     indices = simulator.unassigned_block_indices()
@@ -295,6 +310,38 @@ def test_current_mode_zeros_only_structured_context():
     assert_schema3_observation(current_env, current_observation)
 
 
+def test_current_mode_context_stays_zero_after_step_and_at_terminal():
+    env = make_ten_workspace_env(state_context_mode="current")
+    env.reset(seed=0)
+
+    observation, _reward, terminated, _truncated, _info = env.step(0)
+
+    assert not terminated
+    for key in (
+        "future_blocks",
+        "future_mask",
+        "future_demand",
+        "pending_blocks",
+        "pending_mask",
+        "pending_summary",
+    ):
+        assert np.count_nonzero(observation[key]) == 0
+
+    while not terminated:
+        observation, _reward, terminated, _truncated, _info = env.step(0)
+
+    assert_schema3_observation(env, observation)
+    for key in (
+        "future_blocks",
+        "future_mask",
+        "future_demand",
+        "pending_blocks",
+        "pending_mask",
+        "pending_summary",
+    ):
+        assert np.count_nonzero(observation[key]) == 0
+
+
 @pytest.mark.parametrize("mode", ["future", None, []])
 def test_constructor_rejects_invalid_state_context_mode(mode):
     with pytest.raises(ValueError, match="state_context_mode"):
@@ -313,16 +360,130 @@ def test_constructor_rejects_non_scale_observation_scales():
         make_ten_workspace_env(observation_scales={})
 
 
+def test_fixture_scale_fallback_propagates_zero_working_day_span():
+    fixture = make_observation_fixture(block_count=2)
+    for block in fixture["blocks"]:
+        block.in_date = date(2026, 1, 5)
+
+    with pytest.raises(ValueError, match="date_span_workdays"):
+        BlockPlacementEnv(
+            fixture["blocks"], fixture["workspaces"], grid_size=64
+        )
+
+
 @pytest.mark.parametrize(
     ("scales", "message"),
     [
-        (make_scales(max_workspace_length=99.0), "workspace.*scale"),
+        (make_scales(max_length=9.0), "max_length"),
+        (make_scales(max_breadth=4.0), "max_breadth"),
+        (make_scales(max_duration=9), "max_duration"),
+        (make_scales(base_date=date(2026, 1, 6)), "base_date"),
+        (make_scales(date_span_workdays=1), "date_span_workdays"),
+        (make_scales(max_workspace_length=99.0), "max_workspace_length"),
+        (make_scales(max_workspace_breadth=49.0), "max_workspace_breadth"),
+        (make_scales(max_workspace_area=4_999.0), "max_workspace_area"),
+        (make_scales(total_workspace_area=49_999.0), "total_workspace_area"),
         (make_scales(dropout_threshold=6), "dropout_threshold"),
     ],
 )
-def test_constructor_rejects_incompatible_workspace_scales(scales, message):
+def test_constructor_rejects_incompatible_source_scales(scales, message):
     with pytest.raises(ValueError, match=message):
         make_ten_workspace_env(observation_scales=scales)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda blocks: setattr(blocks[0], "length", 11.0), "max_length"),
+        (lambda blocks: setattr(blocks[0], "breadth", 6.0), "max_breadth"),
+        (
+            lambda blocks: setattr(blocks[0], "original_duration", 11),
+            "max_duration",
+        ),
+        (
+            lambda blocks: setattr(blocks[0], "in_date", date(2026, 1, 2)),
+            "base_date",
+        ),
+        (
+            lambda blocks: setattr(
+                blocks[-1], "in_date", add_workdays(date(2026, 1, 5), 101)
+            ),
+            "date_span_workdays",
+        ),
+    ],
+)
+def test_synthetic_reset_rejects_generated_blocks_outside_scales(
+    mutation, message
+):
+    fixture = make_observation_fixture(block_count=3)
+    generated = [block.clone() for block in fixture["blocks"]]
+    mutation(generated)
+    env = BlockPlacementEnv(
+        fixture["blocks"],
+        fixture["workspaces"],
+        BaseGridStrategy(step=1.0),
+        use_synthetic=True,
+        generator=FixedEpisodeGenerator(generated),
+        synthetic_n_blocks=len(generated),
+        vary_layout=False,
+        grid_size=64,
+        observation_scales=make_scales(),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        env.reset(seed=0)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "scales", "message"),
+    [
+        (
+            lambda workspaces: setattr(workspaces[0], "length", 101.0),
+            make_scales(),
+            "max_workspace_length",
+        ),
+        (
+            lambda workspaces: setattr(workspaces[0], "breadth", 51.0),
+            make_scales(),
+            "max_workspace_breadth",
+        ),
+        (
+            lambda workspaces: setattr(workspaces[0], "breadth", 51.0),
+            make_scales(max_workspace_breadth=60.0),
+            "max_workspace_area",
+        ),
+        (
+            lambda workspaces: setattr(workspaces[0], "breadth", 51.0),
+            make_scales(
+                max_workspace_breadth=60.0,
+                max_workspace_area=6_000.0,
+            ),
+            "total_workspace_area",
+        ),
+    ],
+)
+def test_synthetic_reset_rejects_generated_workspace_outside_scales(
+    mutation, scales, message
+):
+    fixture = make_observation_fixture(block_count=3)
+    generated_workspaces = Workspace.deep_copy_list(fixture["workspaces"])
+    mutation(generated_workspaces)
+    env = BlockPlacementEnv(
+        fixture["blocks"],
+        fixture["workspaces"],
+        BaseGridStrategy(step=1.0),
+        use_synthetic=True,
+        generator=FixedEpisodeGenerator(
+            fixture["blocks"], generated_workspaces
+        ),
+        synthetic_n_blocks=len(fixture["blocks"]),
+        vary_layout=True,
+        grid_size=64,
+        observation_scales=scales,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        env.reset(seed=0)
 
 
 def test_legacy_n_future_blocks_keyword_does_not_change_schema_or_content():
@@ -339,7 +500,7 @@ def test_legacy_n_future_blocks_keyword_does_not_change_schema_or_content():
         )
 
 
-def test_delayed_assignment_changes_pending_state_without_observation_mutation():
+def test_delayed_assignment_uses_exact_pending_workspace_slot_and_delay():
     fixture = make_observation_fixture(block_count=3)
     fixture["workspaces"][0].add_pre_placement(
         PrePlacedBlock(
@@ -363,9 +524,15 @@ def test_delayed_assignment_changes_pending_state_without_observation_mutation()
     after, _, terminated, _, _ = env.step(0)
 
     assert not terminated
-    assert not np.array_equal(after["pending_blocks"], before["pending_blocks"])
-    assert not np.array_equal(after["pending_mask"], before["pending_mask"])
-    assert not np.array_equal(after["pending_summary"], before["pending_summary"])
+    assert np.count_nonzero(before["pending_blocks"]) == 0
+    assert env._placement_simulator.pending_assignment_indices(0) == [0]
+    assert after["pending_mask"][0, 0] == 1.0
+    assert np.count_nonzero(after["pending_mask"]) == 1
+    assert np.count_nonzero(after["pending_mask"][1:]) == 0
+    assert after["pending_blocks"][0, 0, 3] == pytest.approx(2 / 7)
+    assert after["pending_summary"][0, 2] == pytest.approx(2 / 7)
+    assert np.count_nonzero(after["pending_blocks"][1:]) == 0
+    assert np.count_nonzero(after["pending_summary"][1:]) == 0
     np.testing.assert_array_equal(after["grids"][1], before["grids"][1])
     current = env._placement_simulator.current_block
     current_state = vars(current).copy()

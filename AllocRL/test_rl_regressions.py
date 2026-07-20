@@ -14,6 +14,7 @@ from alloc_env.constraints import (
     ValidWorkspacePicker,
 )
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
+from alloc_env.observation_state import ObservationScales
 from alloc_env.simulator import PlacementSimulator, SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
@@ -73,6 +74,21 @@ def make_sized_workspace(length: float, breadth: float) -> Workspace:
         breadth=breadth,
         length=length,
         strategy=BaseGridStrategy(step=10.0),
+    )
+
+
+def fixture_observation_scales() -> ObservationScales:
+    return ObservationScales(
+        max_length=200.0,
+        max_breadth=200.0,
+        max_duration=365,
+        base_date=date(2026, 1, 1),
+        date_span_workdays=365,
+        max_workspace_area=40000.0,
+        total_workspace_area=80000.0,
+        max_workspace_length=200.0,
+        max_workspace_breadth=200.0,
+        dropout_threshold=7,
     )
 
 
@@ -218,6 +234,7 @@ class RlRegressionTests(unittest.TestCase):
             blocks,
             [make_workspace()],
             BaseGridStrategy(step=10.0),
+            observation_scales=fixture_observation_scales(),
             use_synthetic=True,
             generator=generator,
             synthetic_n_blocks=len(blocks),
@@ -243,6 +260,7 @@ class RlRegressionTests(unittest.TestCase):
             [make_block("A001", date(2026, 1, 5))],
             selected,
             BaseGridStrategy(step=10.0),
+            observation_scales=fixture_observation_scales(),
             grid_size=32,
         )
 
@@ -305,6 +323,7 @@ class RlRegressionTests(unittest.TestCase):
             blocks,
             [ws_a, ws_b],
             BaseGridStrategy(step=10.0),
+            observation_scales=fixture_observation_scales(),
             grid_size=32,
         )
 
@@ -388,6 +407,7 @@ class RlRegressionTests(unittest.TestCase):
             [make_block("A001", date(2026, 1, 5))],
             [ws_a, ws_b],
             BaseGridStrategy(step=10.0),
+            observation_scales=fixture_observation_scales(),
             grid_size=32,
         )
 
@@ -451,6 +471,7 @@ class RlRegressionTests(unittest.TestCase):
             [block],
             [make_sized_workspace(length=10.0, breadth=10.0)],
             BaseGridStrategy(step=10.0),
+            observation_scales=fixture_observation_scales(),
             grid_size=32,
         )
 

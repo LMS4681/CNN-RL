@@ -35,6 +35,7 @@ from .observation_state import (
     encode_future_blocks,
     encode_future_demand,
     encode_pending_queues,
+    working_day_position,
 )
 
 # C# AllocConst 대응
@@ -155,8 +156,11 @@ class BlockPlacementEnv(gym.Env):
             self._num_workspaces, self._grid_size
         )
         # ── 정규화 상수 ───────────────────────────────────────────
-        self._observation_scales = (
-            observation_scales or self._build_fixture_observation_scales()
+        self._observation_scales = observation_scales or build_observation_scales(
+            self._original_blocks,
+            self._original_workspaces,
+            DROPOUT_THRESHOLD,
+            require_full_source=False,
         )
         self._validate_observation_scales(self._observation_scales)
         self._base_date = self._observation_scales.base_date
@@ -201,45 +205,52 @@ class BlockPlacementEnv(gym.Env):
     def _get_infeasible_blocks(self) -> List[int]:
         return self._picker.get_infeasible_blocks()
 
-    def _build_fixture_observation_scales(self) -> ObservationScales:
-        try:
-            return build_observation_scales(
-                self._original_blocks,
-                self._original_workspaces,
-                DROPOUT_THRESHOLD,
-                require_full_source=False,
-            )
-        except ValueError as error:
-            if "date_span_workdays must be positive" not in str(error):
-                raise
-
-        blocks = self._original_blocks
-        workspaces = self._original_workspaces
-        if not blocks or not workspaces:
-            raise ValueError(
-                "fixture observation scales require blocks and workspaces"
-            )
-        workspace_areas = [ws.length * ws.breadth for ws in workspaces]
-        return ObservationScales(
-            max_length=max(block.length for block in blocks),
-            max_breadth=max(block.breadth for block in blocks),
-            max_duration=max(block.original_duration for block in blocks),
-            base_date=min(block.in_date for block in blocks),
-            date_span_workdays=1,
-            max_workspace_area=max(workspace_areas),
-            total_workspace_area=sum(workspace_areas),
-            max_workspace_length=max(ws.length for ws in workspaces),
-            max_workspace_breadth=max(ws.breadth for ws in workspaces),
-            dropout_threshold=DROPOUT_THRESHOLD,
+    def _validate_observation_scales(
+        self,
+        scales: ObservationScales,
+        blocks: Optional[List[Block]] = None,
+        workspaces: Optional[List[Workspace]] = None,
+    ) -> None:
+        source_blocks = self._original_blocks if blocks is None else blocks
+        source_workspaces = (
+            self._original_workspaces if workspaces is None else workspaces
         )
-
-    def _validate_observation_scales(self, scales: ObservationScales) -> None:
         if scales.dropout_threshold != DROPOUT_THRESHOLD:
             raise ValueError(
                 "observation scales dropout_threshold does not match environment"
             )
+        if source_blocks:
+            if max(block.length for block in source_blocks) > scales.max_length:
+                raise ValueError(
+                    "source blocks exceed observation scales max_length"
+                )
+            if max(block.breadth for block in source_blocks) > scales.max_breadth:
+                raise ValueError(
+                    "source blocks exceed observation scales max_breadth"
+                )
+            if (
+                max(block.original_duration for block in source_blocks)
+                > scales.max_duration
+            ):
+                raise ValueError(
+                    "source blocks exceed observation scales max_duration"
+                )
+            earliest_start = min(block.in_date for block in source_blocks)
+            if scales.base_date > earliest_start:
+                raise ValueError(
+                    "observation scales base_date is later than source blocks"
+                )
+            latest_start = max(block.in_date for block in source_blocks)
+            if (
+                working_day_position(scales.base_date, latest_start)
+                > scales.date_span_workdays
+            ):
+                raise ValueError(
+                    "source blocks exceed observation scales date_span_workdays"
+                )
+
         workspace_areas = []
-        for workspace in self._original_workspaces:
+        for workspace in source_workspaces:
             if (
                 not np.isfinite(workspace.length)
                 or not np.isfinite(workspace.breadth)
@@ -250,18 +261,27 @@ class BlockPlacementEnv(gym.Env):
                     "workspace geometry must be finite and positive"
                 )
             workspace_areas.append(workspace.length * workspace.breadth)
-        scale_mismatch = (
-            any(
-                workspace.length > scales.max_workspace_length
-                or workspace.breadth > scales.max_workspace_breadth
-                for workspace in self._original_workspaces
-            )
-            or any(area > scales.max_workspace_area for area in workspace_areas)
-            or sum(workspace_areas) > scales.total_workspace_area
-        )
-        if scale_mismatch:
+        if any(
+            workspace.length > scales.max_workspace_length
+            for workspace in source_workspaces
+        ):
             raise ValueError(
-                "workspace geometry exceeds observation scale bounds"
+                "workspaces exceed observation scales max_workspace_length"
+            )
+        if any(
+            workspace.breadth > scales.max_workspace_breadth
+            for workspace in source_workspaces
+        ):
+            raise ValueError(
+                "workspaces exceed observation scales max_workspace_breadth"
+            )
+        if any(area > scales.max_workspace_area for area in workspace_areas):
+            raise ValueError(
+                "workspaces exceed observation scales max_workspace_area"
+            )
+        if sum(workspace_areas) > scales.total_workspace_area:
+            raise ValueError(
+                "workspaces exceed observation scales total_workspace_area"
             )
 
     def _update_ws_areas(self):
@@ -383,6 +403,11 @@ class BlockPlacementEnv(gym.Env):
                 )
                 self._num_blocks = len(self._blocks)
                 self._rebuild_workspaces()
+                self._validate_observation_scales(
+                    self._observation_scales,
+                    self._blocks,
+                    self._workspaces,
+                )
                 self._picker = ValidWorkspacePicker(
                     self._blocks, self._workspaces, self._constraints
                 )
@@ -396,6 +421,11 @@ class BlockPlacementEnv(gym.Env):
             self._blocks = [b.clone() for b in self._original_blocks]
             self._num_blocks = len(self._blocks)
             self._rebuild_workspaces()
+            self._validate_observation_scales(
+                self._observation_scales,
+                self._blocks,
+                self._workspaces,
+            )
             self._picker = ValidWorkspacePicker(
                 self._blocks, self._workspaces, self._constraints
             )
@@ -432,7 +462,10 @@ class BlockPlacementEnv(gym.Env):
         prev_env_date = self._env_date
         prev_grid_signatures = self._workspace_grid_signatures(prev_env_date)
 
-        self._placement_simulator.assign_current(action)
+        candidate_position = self._candidate_placements[action].position
+        self._placement_simulator.assign_current(
+            action, placement_override=candidate_position
+        )
         self._sync_from_simulator(invalidate_grids=False)
 
         if self._env_date != prev_env_date:

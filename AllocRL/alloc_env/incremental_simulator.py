@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import math
 from typing import List, Optional, Tuple
 
 from . import calendar as cal
 from .block import Block
 from .simulator import SimulationResult
 from .workspace import Workspace
+
+
+_PLACEMENT_OVERRIDE_UNSET = object()
 
 
 @dataclass
@@ -105,13 +109,40 @@ class IncrementalPlacementSimulator:
             return None
         return self.blocks[self.current_block_index]
 
-    def assign_current(self, workspace_index: int) -> PlacementStepResult:
+    def assign_current(
+        self,
+        workspace_index: int,
+        placement_override=_PLACEMENT_OVERRIDE_UNSET,
+    ) -> PlacementStepResult:
         if self.current_block_index is None:
             raise RuntimeError("No block is waiting for assignment.")
+        if placement_override is not _PLACEMENT_OVERRIDE_UNSET:
+            if placement_override is not None:
+                if (
+                    not isinstance(placement_override, tuple)
+                    or len(placement_override) != 2
+                ):
+                    raise ValueError(
+                        "placement_override must be None or a length-two tuple"
+                    )
+                try:
+                    finite = all(
+                        math.isfinite(value) for value in placement_override
+                    )
+                except TypeError as error:
+                    raise ValueError(
+                        "placement_override coordinates must be finite"
+                    ) from error
+                if not finite:
+                    raise ValueError(
+                        "placement_override coordinates must be finite"
+                    )
 
         block_index = self.current_block_index
         self.assignments[block_index] = int(workspace_index)
-        result = self._process_assigned_block(block_index)
+        result = self._process_assigned_block(
+            block_index, placement_override=placement_override
+        )
         self._record_result(result)
         self._advance_to_next_decision()
         return result
@@ -231,7 +262,11 @@ class IncrementalPlacementSimulator:
         delay = self.current_delay_workdays(idx)
         return (-delay, self._original_blocks[idx].in_date, idx)
 
-    def _process_assigned_block(self, idx: int) -> PlacementStepResult:
+    def _process_assigned_block(
+        self,
+        idx: int,
+        placement_override=_PLACEMENT_OVERRIDE_UNSET,
+    ) -> PlacementStepResult:
         assignment = self.assignments[idx]
         if assignment is None:
             raise RuntimeError("Cannot process a block without assignment.")
@@ -248,8 +283,11 @@ class IncrementalPlacementSimulator:
             )
 
         workspace = self.workspaces[assignment]
-        trial = block.clone()
-        pos = workspace.determine_placement_position(trial, self.env_date)
+        if placement_override is _PLACEMENT_OVERRIDE_UNSET:
+            trial = block.clone()
+            pos = workspace.determine_placement_position(trial, self.env_date)
+        else:
+            pos = placement_override
 
         if pos is not None:
             cx, cy = pos
