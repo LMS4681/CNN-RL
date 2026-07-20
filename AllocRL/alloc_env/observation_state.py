@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
+from numbers import Integral, Real
 from typing import Any, Mapping, Sequence
 
 import gymnasium as gym
@@ -30,6 +31,32 @@ PENDING_BLOCK_FEATURE_DIM = 7
 PENDING_SUMMARY_FEATURE_DIM = 4
 WORKSPACE_META_FEATURE_DIM = 4
 
+_FLOAT_SCALE_FIELDS = (
+    "max_length",
+    "max_breadth",
+    "max_workspace_area",
+    "total_workspace_area",
+    "max_workspace_length",
+    "max_workspace_breadth",
+)
+_INTEGER_SCALE_FIELDS = (
+    "max_duration",
+    "date_span_workdays",
+    "dropout_threshold",
+)
+_OBSERVATION_SCALE_FIELDS = (
+    "max_length",
+    "max_breadth",
+    "max_duration",
+    "base_date",
+    "date_span_workdays",
+    "max_workspace_area",
+    "total_workspace_area",
+    "max_workspace_length",
+    "max_workspace_breadth",
+    "dropout_threshold",
+)
+
 
 @dataclass(frozen=True)
 class ObservationScales:
@@ -45,23 +72,25 @@ class ObservationScales:
     dropout_threshold: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.base_date, date):
-            raise TypeError("base_date must be a date")
-        denominator_fields = (
-            "max_length",
-            "max_breadth",
-            "max_duration",
-            "date_span_workdays",
-            "max_workspace_area",
-            "total_workspace_area",
-            "max_workspace_length",
-            "max_workspace_breadth",
-            "dropout_threshold",
-        )
-        for field_name in denominator_fields:
+        if (
+            not isinstance(self.base_date, date)
+            or isinstance(self.base_date, datetime)
+        ):
+            raise TypeError("base_date must be a date, not datetime")
+        for field_name in _FLOAT_SCALE_FIELDS:
             value = getattr(self, field_name)
-            if not math.isfinite(float(value)) or value <= 0:
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{field_name} must be a real number")
+            if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{field_name} must be finite and positive")
+            object.__setattr__(self, field_name, float(value))
+        for field_name in _INTEGER_SCALE_FIELDS:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{field_name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive")
+            object.__setattr__(self, field_name, int(value))
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -70,12 +99,36 @@ class ObservationScales:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "ObservationScales":
+        if not isinstance(values, Mapping):
+            raise TypeError("ObservationScales values must be a mapping")
+        expected = set(_OBSERVATION_SCALE_FIELDS)
+        actual = set(values)
+        missing = sorted(expected - actual)
+        if missing:
+            raise ValueError(
+                f"missing ObservationScales fields: {', '.join(missing)}"
+            )
+        unexpected = sorted(str(field_name) for field_name in actual - expected)
+        if unexpected:
+            raise ValueError(
+                f"unexpected ObservationScales fields: {', '.join(unexpected)}"
+            )
+
+        serialized_date = values["base_date"]
+        if not isinstance(serialized_date, str):
+            raise TypeError("base_date must be an ISO date string")
+        try:
+            parsed_date = date.fromisoformat(serialized_date)
+        except ValueError as error:
+            raise ValueError("base_date must be an ISO date string") from error
         parsed = dict(values)
-        parsed["base_date"] = date.fromisoformat(str(parsed["base_date"]))
+        parsed["base_date"] = parsed_date
         return cls(**parsed)
 
 
 def _clip01(value: float) -> np.float32:
+    if not math.isfinite(value):
+        raise ValueError("observation feature values must be finite")
     return np.float32(np.clip(value, 0.0, 1.0))
 
 
@@ -91,6 +144,27 @@ def working_day_position(start: date, current: date) -> int:
 
 def _feature_array(values: Sequence[float]) -> np.ndarray:
     return np.asarray([_clip01(value) for value in values], dtype=np.float32)
+
+
+def _validate_block_indices(
+    blocks: Sequence[Block], indices: Sequence[int]
+) -> tuple[int, ...]:
+    validated = []
+    seen = set()
+    for position, index in enumerate(indices):
+        if isinstance(index, bool) or not isinstance(index, Integral):
+            raise TypeError(f"indices[{position}] must be an integer")
+        normalized = int(index)
+        if not 0 <= normalized < len(blocks):
+            raise IndexError(
+                f"indices[{position}]={normalized} is out of range for "
+                f"{len(blocks)} blocks"
+            )
+        if normalized in seen:
+            raise ValueError(f"duplicate block index {normalized}")
+        validated.append(normalized)
+        seen.add(normalized)
+    return tuple(validated)
 
 
 def build_observation_scales(
@@ -126,8 +200,8 @@ def build_observation_scales(
         max_breadth=max(block.breadth for block in blocks),
         max_duration=max(block.original_duration for block in blocks),
         base_date=minimum_start,
-        date_span_workdays=max(
-            working_days_until(minimum_start, maximum_start), 1
+        date_span_workdays=working_days_until(
+            minimum_start, maximum_start
         ),
         max_workspace_area=max(workspace_areas),
         total_workspace_area=sum(workspace_areas),
@@ -164,11 +238,12 @@ def encode_future_blocks(
     env_date: date,
     scales: ObservationScales,
 ) -> tuple[np.ndarray, np.ndarray]:
+    validated_indices = _validate_block_indices(blocks, indices)
     features = np.zeros(
         (ORDERED_FUTURE_COUNT, FUTURE_BLOCK_FEATURE_DIM), dtype=np.float32
     )
     mask = np.zeros(ORDERED_FUTURE_COUNT, dtype=np.float32)
-    for slot, index in enumerate(indices[:ORDERED_FUTURE_COUNT]):
+    for slot, index in enumerate(validated_indices[:ORDERED_FUTURE_COUNT]):
         block = blocks[index]
         features[slot] = _feature_array([
             block.length / scales.max_length,
@@ -190,13 +265,14 @@ def encode_future_demand(
     env_date: date,
     scales: ObservationScales,
 ) -> np.ndarray:
+    validated_indices = _validate_block_indices(blocks, indices)
     demand = np.zeros(
         (len(FUTURE_DAY_WINDOWS), FUTURE_DEMAND_FEATURE_DIM),
         dtype=np.float32,
     )
     indexed_offsets = [
         (blocks[index], working_days_until(env_date, blocks[index].in_date))
-        for index in indices
+        for index in validated_indices
     ]
     for row, (window_start, window_end) in enumerate(FUTURE_DAY_WINDOWS):
         window_blocks = [

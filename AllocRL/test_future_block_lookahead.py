@@ -244,6 +244,23 @@ def test_current_block_clips_every_feature_and_does_not_mutate_block():
     assert vars(block) == before
 
 
+@pytest.mark.parametrize(
+    ("mutation", "assigned_count"),
+    [
+        (lambda block: setattr(block, "length", float("nan")), 0),
+        (lambda _block: None, float("inf")),
+    ],
+)
+def test_current_block_rejects_nonfinite_features(mutation, assigned_count):
+    block = make_encoder_block(0, date(2026, 1, 5))
+    mutation(block)
+
+    with pytest.raises(ValueError, match="finite"):
+        encode_current_block(
+            block, date(2026, 1, 5), assigned_count, make_encoder_scales()
+        )
+
+
 def test_future_blocks_preserve_passed_order_mask_and_zero_padding():
     base = date(2026, 1, 5)
     scales = make_encoder_scales()
@@ -288,6 +305,67 @@ def test_future_blocks_truncate_to_first_16_indices():
     assert encoded[0, 0] == pytest.approx(blocks[19].length / 10.0)
 
 
+@pytest.mark.parametrize("encoder", [encode_future_blocks, encode_future_demand])
+@pytest.mark.parametrize(
+    ("indices", "error", "message"),
+    [
+        ([-1], IndexError, "out of range"),
+        ([2], IndexError, "out of range"),
+        ([True], TypeError, "integer"),
+        ([0.5], TypeError, "integer"),
+        ([0, 0], ValueError, "duplicate"),
+    ],
+)
+def test_future_encoders_reject_invalid_indices(
+    encoder, indices, error, message
+):
+    base = date(2026, 1, 5)
+    blocks = [make_encoder_block(index, base) for index in range(2)]
+
+    with pytest.raises(error, match=message):
+        encoder(blocks, indices, base, make_encoder_scales())
+
+
+def test_future_blocks_validates_indices_beyond_encoded_limit():
+    base = date(2026, 1, 5)
+    blocks = [make_encoder_block(index, base) for index in range(16)]
+
+    with pytest.raises(IndexError, match="out of range"):
+        encode_future_blocks(
+            blocks, list(range(16)) + [16], base, make_encoder_scales()
+        )
+
+
+def test_future_encoders_accept_numpy_integral_indices_in_caller_order():
+    base = date(2026, 1, 5)
+    blocks = [
+        make_encoder_block(0, base, length=2.0),
+        make_encoder_block(1, base, length=6.0),
+    ]
+    indices = [np.int64(1), np.int32(0)]
+
+    encoded, mask = encode_future_blocks(
+        blocks, indices, base, make_encoder_scales()
+    )
+    demand = encode_future_demand(
+        blocks, indices, base, make_encoder_scales()
+    )
+
+    np.testing.assert_allclose(encoded[:2, 0], [0.6, 0.2])
+    np.testing.assert_array_equal(mask[:2], np.ones(2, np.float32))
+    assert demand[0, 0] == pytest.approx(2 / 913)
+    np.testing.assert_array_equal(indices, [np.int64(1), np.int32(0)])
+
+
+def test_future_blocks_reject_nonfinite_features():
+    base = date(2026, 1, 5)
+    block = make_encoder_block(0, base)
+    block.breadth = float("inf")
+
+    with pytest.raises(ValueError, match="finite"):
+        encode_future_blocks([block], [0], base, make_encoder_scales())
+
+
 def test_future_working_day_windows_include_exact_boundaries():
     base = date(2026, 1, 5)
     arrivals = [0, 5, 6, 20, 21, 60, 61]
@@ -322,6 +400,15 @@ def test_future_demand_empty_windows_are_zero_and_uses_only_passed_indices():
     assert demand[1, 0] == pytest.approx(1 / 913)
     assert np.count_nonzero(demand[2]) == 0
     assert np.all((0.0 <= demand) & (demand <= 1.0))
+
+
+def test_future_demand_rejects_nonfinite_features():
+    base = date(2026, 1, 5)
+    block = make_encoder_block(0, base)
+    block.length = float("inf")
+
+    with pytest.raises(ValueError, match="finite"):
+        encode_future_demand([block], [0], base, make_encoder_scales())
 
 
 if __name__ == "__main__":
