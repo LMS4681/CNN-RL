@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -26,9 +28,26 @@ EXPECTED_OBSERVATION_KEYS = {
 }
 
 
-def _validate_observation_space(
+@dataclass(frozen=True)
+class ValidatedObservationSchema:
+    n_workspaces: int
+    grid_channels: int
+    grid_height: int
+    grid_width: int
+
+    @property
+    def grid_shape(self) -> tuple[int, int, int, int]:
+        return (
+            self.n_workspaces,
+            self.grid_channels,
+            self.grid_height,
+            self.grid_width,
+        )
+
+
+def validate_observation_space(
     observation_space: gym.spaces.Dict,
-) -> None:
+) -> ValidatedObservationSchema:
     actual_keys = set(observation_space.spaces)
     missing = sorted(EXPECTED_OBSERVATION_KEYS - actual_keys)
     unexpected = sorted(actual_keys - EXPECTED_OBSERVATION_KEYS)
@@ -52,17 +71,32 @@ def _validate_observation_space(
             )
 
     grid_shape = observation_space["grids"].shape
-    if (
-        len(grid_shape) != 4
-        or grid_shape[:2] != (N_WORKSPACES, 4)
-        or grid_shape[2] < 1
-        or grid_shape[3] < 1
-    ):
+    if len(grid_shape) != 4:
         raise ValueError(
-            "Schema-3 grids must have shape "
-            f"({N_WORKSPACES}, 4, height, width) with positive spatial "
-            f"dimensions, got {grid_shape}."
+            "Schema-3 grids must have rank 4 and shape "
+            f"({N_WORKSPACES}, 4, height, width), got {grid_shape}."
         )
+    n_workspaces, grid_channels, grid_height, grid_width = grid_shape
+    if n_workspaces != N_WORKSPACES:
+        raise ValueError(
+            "Schema-3 grids workspace count must be "
+            f"{N_WORKSPACES}, got {n_workspaces}."
+        )
+    if grid_channels != 4:
+        raise ValueError(
+            f"Schema-3 grids channel count must be 4, got {grid_channels}."
+        )
+    if grid_height < 1 or grid_width < 1:
+        raise ValueError(
+            "Schema-3 grids spatial dimensions must be positive, "
+            f"got {(grid_height, grid_width)}."
+        )
+    return ValidatedObservationSchema(
+        n_workspaces=n_workspaces,
+        grid_channels=grid_channels,
+        grid_height=grid_height,
+        grid_width=grid_width,
+    )
 
 
 class StructuredStateEncoder(nn.Module):
@@ -144,10 +178,10 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
         observation_space: gym.spaces.Dict,
         features_dim: int,
         grid_feature_dim: int,
+        schema: ValidatedObservationSchema,
     ):
-        _validate_observation_space(observation_space)
         super().__init__(observation_space, features_dim)
-        self.n_workspaces = N_WORKSPACES
+        self.n_workspaces = schema.n_workspaces
         self.structured_encoder = StructuredStateEncoder()
 
         workspace_input_dim = (
@@ -173,7 +207,7 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
     def _grid_features(
         self,
         observations: dict[str, torch.Tensor],
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         return None
 
     def forward(
@@ -209,7 +243,13 @@ class StructuredExtractor(_WorkspaceExtractor):
         observation_space: gym.spaces.Dict,
         features_dim: int = 256,
     ):
-        super().__init__(observation_space, features_dim, grid_feature_dim=0)
+        schema = validate_observation_space(observation_space)
+        super().__init__(
+            observation_space,
+            features_dim,
+            grid_feature_dim=0,
+            schema=schema,
+        )
 
 
 class FixedGridExtractor(_WorkspaceExtractor):
@@ -222,16 +262,15 @@ class FixedGridExtractor(_WorkspaceExtractor):
         observation_space: gym.spaces.Dict,
         features_dim: int = 256,
     ):
-        grid_channels = observation_space["grids"].shape[1]
-        if grid_channels != 4:
-            raise ValueError(
-                f"FixedGridExtractor requires 4 grid channels, got {grid_channels}."
-            )
-        grid_feature_dim = grid_channels * self.pooled_size * self.pooled_size
+        schema = validate_observation_space(observation_space)
+        grid_feature_dim = (
+            schema.grid_channels * self.pooled_size * self.pooled_size
+        )
         super().__init__(
             observation_space,
             features_dim,
             grid_feature_dim=grid_feature_dim,
+            schema=schema,
         )
 
     def _grid_features(
@@ -259,12 +298,8 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
         observation_space: gym.spaces.Dict,
         features_dim: int = 256,
     ):
-        grid_shape = observation_space["grids"].shape
-        grid_channels = grid_shape[1]
-        if grid_channels != 4:
-            raise ValueError(
-                f"CandidateCnnExtractor requires 4 grid channels, got {grid_channels}."
-            )
+        schema = validate_observation_space(observation_space)
+        grid_shape = schema.grid_shape
 
         # Integral fixed-grid resize matches adaptive 8x8 pooling while
         # remaining exportable with a dynamic ONNX batch axis.
@@ -297,6 +332,7 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
             observation_space,
             features_dim,
             grid_feature_dim=self.image_feature_dim,
+            schema=schema,
         )
         self.image_encoder = nn.Sequential(
             nn.Conv2d(4, 32, 5, stride=1, padding=2),
