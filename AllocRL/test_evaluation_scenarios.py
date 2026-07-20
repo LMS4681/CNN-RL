@@ -49,6 +49,7 @@ from evaluation_scenarios import (
 )
 from run_ablation import (
     ABLATIONS,
+    HyperparameterSpec,
     _block_source_path,
     build_baseline_command,
     build_ablation_commands,
@@ -462,7 +463,15 @@ class EvaluationScenarioTests(unittest.TestCase):
 
     def test_ablation_matrix_contains_five_models_per_seed(self):
         commands = build_ablation_commands(
-            "screening", [0, 1, 2], ["--data-dir", "./data"]
+            "screening",
+            [0, 1, 2],
+            [
+                HyperparameterSpec(0.98, 512),
+                HyperparameterSpec(0.98, 960),
+                HyperparameterSpec(0.995, 512),
+                HyperparameterSpec(0.995, 960),
+            ],
+            ["--data-dir", "./data"],
         )
 
         self.assertEqual(
@@ -475,7 +484,7 @@ class EvaluationScenarioTests(unittest.TestCase):
             },
             ABLATIONS,
         )
-        self.assertEqual(15, len(commands))
+        self.assertEqual(60, len(commands))
         joined = [" ".join(command) for command in commands]
         self.assertTrue(
             any(
@@ -498,15 +507,20 @@ class EvaluationScenarioTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            all("--timesteps 20000" in command for command in joined)
+            all("--timesteps 300000" in command for command in joined)
         )
 
     def test_final_ablation_uses_full_budget(self):
-        commands = build_ablation_commands("final", [7], [])
+        commands = build_ablation_commands(
+            "final",
+            [0, 1, 2, 3, 4],
+            [HyperparameterSpec(0.995, 960)],
+            [],
+        )
 
-        self.assertEqual(5, len(commands))
+        self.assertEqual(25, len(commands))
         self.assertTrue(
-            all("--timesteps 100000" in " ".join(c) for c in commands)
+            all("--timesteps 1000000" in " ".join(c) for c in commands)
         )
 
     def test_baseline_command_uses_the_fixed_holdout_bundle(self):

@@ -8,7 +8,6 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 
 @dataclass(frozen=True, eq=False)
@@ -92,21 +91,15 @@ def _block_source_path(data_dir: Path) -> Path:
 def build_ablation_commands(
     stage: str,
     seeds: list[int],
-    hyperparameters: list[HyperparameterSpec] | list[str],
-    common_args: list[str] | None = None,
+    hyperparameters: list[HyperparameterSpec],
+    common_args: list[str],
 ) -> list[list[str]]:
-    if common_args is None:
-        if not all(isinstance(argument, str) for argument in hyperparameters):
-            raise TypeError(
-                "common_args is required by the staged ablation contract"
-            )
-        return _build_legacy_ablation_commands(
-            stage, seeds, cast(list[str], hyperparameters)
-        )
     if stage not in STAGES:
         raise ValueError("stage must be 'smoke', 'screening', or 'final'")
     _validate_common_args(common_args)
-    selected = tuple(cast(list[HyperparameterSpec], hyperparameters))
+    if tuple(seeds) != STAGES[stage][1]:
+        raise ValueError("seeds must be the exact frozen seed tuple for stage")
+    selected = tuple(hyperparameters)
     if stage == "smoke" and selected != SMOKE_HYPERPARAMETERS:
         raise ValueError("smoke requires the default (0.98, 960) pair")
     if stage == "screening" and selected != SCREENING_HYPERPARAMETERS:
@@ -115,9 +108,6 @@ def build_ablation_commands(
         raise ValueError("final requires exactly one hyperparameter pair")
     if stage == "final" and selected[0] not in SCREENING_HYPERPARAMETERS:
         raise ValueError("final hyperparameters must be selected from screening")
-    if not seeds:
-        raise ValueError("At least one seed is required")
-
     timesteps = STAGES[stage][0]
     commands: list[list[str]] = []
     for label, experiment in ABLATIONS.items():
@@ -164,49 +154,16 @@ def build_ablation_commands(
 
 def _validate_common_args(common_args: list[str]) -> None:
     conflicts = sorted({
-        argument.split("=", 1)[0]
+        controlled_flag
         for argument in common_args
-        if argument.split("=", 1)[0] in CONTROLLED_TRAIN_FLAGS
+        for controlled_flag in CONTROLLED_TRAIN_FLAGS
+        if controlled_flag.startswith(argument.split("=", 1)[0])
     })
     if conflicts:
         raise ValueError(
             "common_args contains matrix-controlled options: "
             + ", ".join(conflicts)
         )
-
-
-def _build_legacy_ablation_commands(
-    mode: str, seeds: list[int], common_args: list[str]
-) -> list[list[str]]:
-    """Keep the Stage-A helper contract; the CLI no longer uses this path."""
-    if mode not in {"screening", "final"}:
-        raise ValueError("mode must be 'screening' or 'final'")
-    timesteps = 20_000 if mode == "screening" else 100_000
-    commands: list[list[str]] = []
-    for seed in seeds:
-        for label, experiment in ABLATIONS.items():
-            output = f"./output_ablation/{mode}/{label}/seed_{seed}"
-            commands.append(
-                [
-                    sys.executable,
-                    "train.py",
-                    *common_args,
-                    "--timesteps",
-                    str(timesteps),
-                    "--extractor",
-                    experiment.extractor,
-                    "--state-context",
-                    experiment.state_context,
-                    "--seed",
-                    str(seed),
-                    "--output-dir",
-                    output,
-                    "--eval-scenarios",
-                    FIXED_SCENARIO_PATH,
-                    "--no-export-onnx",
-                ]
-            )
-    return commands
 
 
 def build_baseline_command(
@@ -287,7 +244,9 @@ def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run AllocRL A-E ablations")
+    parser = argparse.ArgumentParser(
+        description="Run AllocRL A-E ablations", allow_abbrev=False
+    )
     parser.add_argument(
         "--stage", choices=tuple(STAGES), default=None
     )
@@ -295,13 +254,15 @@ def main() -> None:
         "--selected-gae-lambda",
         type=float,
         choices=[0.98, 0.995],
-        default=None,
+        action="append",
+        default=[],
     )
     parser.add_argument(
         "--selected-n-steps",
         type=int,
         choices=[512, 960],
-        default=None,
+        action="append",
+        default=[],
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--prepare-eval-scenarios", action="store_true")
@@ -311,6 +272,12 @@ def main() -> None:
         "--scenario-path", default="./data/fixed_eval_scenarios.json"
     )
     args, extra_args = parser.parse_known_args()
+
+    if (
+        len(args.selected_gae_lambda) > 1
+        or len(args.selected_n_steps) > 1
+    ):
+        parser.error("selected hyperparameters may each be specified only once")
 
     if args.prepare_eval_scenarios:
         output_path = Path(args.scenario_path)
@@ -334,9 +301,9 @@ def main() -> None:
         parser.error(
             "--stage is required unless preparing scenarios or evaluating baselines"
         )
-    selected_values = (
-        args.selected_gae_lambda,
-        args.selected_n_steps,
+    selected_values = tuple(
+        values[0] if values else None
+        for values in (args.selected_gae_lambda, args.selected_n_steps)
     )
     if args.stage != "final" and any(
         value is not None for value in selected_values

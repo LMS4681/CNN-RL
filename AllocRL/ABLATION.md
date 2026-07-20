@@ -115,7 +115,7 @@ py -B run_ablation.py --stage final --selected-gae-lambda 0.995 --selected-n-ste
 The final values `0.995` and `960` are illustrative. Replace both with the
 winning screening pair recorded in `screening_selection.json`.
 
-Use `--dry-run` on any invocation to print commands without executing them.
+Use `--dry-run` only with `--stage` to print staged training commands without executing them. It does not suppress explicit scenario preparation or baseline evaluation requested with `--prepare-eval-scenarios` or `--evaluate-baselines`.
 Every run uses the fixed holdout bundle, automatic resume, 50,000-timestep
 checkpoints and holdout selection, and no ONNX export. Final runs additionally
 produce the final holdout report. Outputs are isolated at

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from run_ablation import (
     ExperimentSpec,
     HyperparameterSpec,
     build_ablation_commands,
+    build_baseline_command,
     main,
 )
 
@@ -121,10 +123,22 @@ def test_final_rejects_anything_other_than_one_hyperparameter_pair(
 
 
 def test_new_contract_rejects_omitted_common_args():
-    with pytest.raises(TypeError, match="common_args is required"):
+    with pytest.raises(TypeError, match="required positional argument"):
         build_ablation_commands(
             "smoke", [0], [HyperparameterSpec(0.98, 960)]
         )
+
+
+def test_builder_has_no_legacy_three_argument_adapter():
+    assert list(inspect.signature(build_ablation_commands).parameters) == [
+        "stage",
+        "seeds",
+        "hyperparameters",
+        "common_args",
+    ]
+
+    with pytest.raises(TypeError):
+        build_ablation_commands("screening", [0, 1, 2], [])
 
 
 def test_commands_have_deterministic_order_and_collision_free_exact_paths():
@@ -193,6 +207,35 @@ def test_common_args_cannot_override_matrix_controlled_options(flag):
         )
 
 
+def test_common_args_reject_abbreviated_controlled_options():
+    with pytest.raises(ValueError, match="controlled"):
+        build_ablation_commands(
+            "smoke",
+            [0],
+            [HyperparameterSpec(0.98, 960)],
+            ["--final-holdout"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage", "seeds", "hyperparameters"),
+    [
+        ("smoke", [0, 0], [HyperparameterSpec(0.98, 960)]),
+        ("screening", [0, 1], SCREENING_GRID),
+        ("screening", [0, 1, 2, 3], SCREENING_GRID),
+        ("screening", [1, 0, 2], SCREENING_GRID),
+        ("final", [0, 1, 2, 3], [HyperparameterSpec(0.995, 960)]),
+    ],
+)
+def test_builder_rejects_any_seed_sequence_other_than_its_stage_tuple(
+    stage: str,
+    seeds: list[int],
+    hyperparameters: list[HyperparameterSpec],
+):
+    with pytest.raises(ValueError, match="exact frozen seed tuple"):
+        build_ablation_commands(stage, seeds, hyperparameters, [])
+
+
 def test_dry_run_prints_five_shell_usable_smoke_commands(capsys):
     with (
         patch.object(
@@ -211,6 +254,152 @@ def test_dry_run_prints_five_shell_usable_smoke_commands(capsys):
         for line in output
     )
     run.assert_not_called()
+
+
+def test_dry_run_does_not_suppress_explicit_scenario_preparation(tmp_path):
+    scenario_path = tmp_path / "fixed.json"
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "run_ablation.py",
+                "--prepare-eval-scenarios",
+                "--dry-run",
+                "--scenario-path",
+                str(scenario_path),
+            ],
+        ),
+        patch("run_ablation.prepare_evaluation_file") as prepare,
+    ):
+        main()
+
+    prepare.assert_called_once_with(Path("./data"), scenario_path)
+
+
+def test_dry_run_does_not_suppress_explicit_baseline_evaluation():
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["run_ablation.py", "--evaluate-baselines", "--dry-run"],
+        ),
+        patch("run_ablation.subprocess.run") as run,
+    ):
+        main()
+
+    run.assert_called_once_with(
+        build_baseline_command(
+            "./data/fixed_eval_scenarios.json",
+            "./output_ablation/baselines/evaluation_scenarios.csv",
+        ),
+        check=True,
+    )
+
+
+def test_documentation_scopes_dry_run_to_staged_training_commands():
+    documentation = Path("ABLATION.md").read_text(encoding="utf-8")
+
+    assert "only with `--stage`" in documentation
+    assert "does not suppress explicit scenario preparation or baseline evaluation" in (
+        documentation
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "run_ablation.py",
+            "--stage",
+            "final",
+            "--dry-run",
+            "--selected-gae-lambda",
+            "0.98",
+            "--selected-gae-lambda",
+            "0.995",
+            "--selected-n-steps",
+            "960",
+        ],
+        [
+            "run_ablation.py",
+            "--stage",
+            "final",
+            "--dry-run",
+            "--selected-gae-lambda",
+            "0.98",
+            "--selected-n-steps",
+            "512",
+            "--selected-n-steps",
+            "960",
+        ],
+    ],
+)
+def test_cli_rejects_repeated_final_selection_options(argv):
+    with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+        main()
+
+
+def test_cli_rejects_repeated_selection_options_before_preparation():
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "run_ablation.py",
+                "--prepare-eval-scenarios",
+                "--selected-gae-lambda",
+                "0.98",
+                "--selected-gae-lambda",
+                "0.995",
+            ],
+        ),
+        patch("run_ablation.prepare_evaluation_file") as prepare,
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    prepare.assert_not_called()
+
+
+def test_cli_rejects_repeated_selection_options_before_baselines():
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "run_ablation.py",
+                "--evaluate-baselines",
+                "--selected-n-steps",
+                "512",
+                "--selected-n-steps",
+                "960",
+            ],
+        ),
+        patch("run_ablation.subprocess.run") as run,
+        pytest.raises(SystemExit),
+    ):
+        main()
+
+    run.assert_not_called()
+
+
+def test_cli_rejects_abbreviated_forwarded_controlled_options():
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "run_ablation.py",
+                "--stage",
+                "smoke",
+                "--dry-run",
+                "--final-holdout",
+            ],
+        ),
+        pytest.raises(SystemExit),
+    ):
+        main()
 
 
 @pytest.mark.parametrize(
