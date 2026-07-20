@@ -72,21 +72,16 @@ class OccupancyGridRenderer:
             center_x, center_y, length, breadth
         )
 
-        left = center_x - length / 2.0
-        right = center_x + length / 2.0
-        bottom = center_y - breadth / 2.0
-        top = center_y + breadth / 2.0
-
         x0, x1 = self._axis_bounds(
-            left,
-            right,
+            center_x,
+            length,
             ws.origin_x,
             ws.length,
             mapping.x_px_per_m,
         )
         y0, y1 = self._axis_bounds(
-            bottom,
-            top,
+            center_y,
+            breadth,
             ws.origin_y,
             ws.breadth,
             mapping.y_px_per_m,
@@ -100,6 +95,8 @@ class OccupancyGridRenderer:
             dtype=np.float32,
         )
         for block in ws.blocks:
+            if not block.in_date <= env_date <= block.out_date:
+                continue
             self._render_existing_exclusion(
                 grid,
                 ws,
@@ -221,13 +218,24 @@ class OccupancyGridRenderer:
 
     def _axis_bounds(
         self,
-        low: float,
-        high: float,
+        center: float,
+        rectangle_extent: float,
         origin: float,
-        extent: float,
+        workspace_extent: float,
         px_per_m: float,
     ) -> tuple[int, int]:
-        axis_end = origin + extent
+        low = center - rectangle_extent / 2.0
+        high = center + rectangle_extent / 2.0
+        axis_end = origin + workspace_extent
+        if high <= low:
+            if center < origin:
+                return 0, 0
+            if center > axis_end:
+                return self.grid_size, self.grid_size
+            pixel = math.floor((center - origin) * px_per_m)
+            pixel = min(max(pixel, 0), self.grid_size - 1)
+            return pixel, pixel + 1
+
         clipped_low = max(low, origin)
         clipped_high = min(high, axis_end)
         if clipped_high <= clipped_low:
@@ -368,6 +376,7 @@ class BaseGridCache:
         )
         self._dirty = [True] * self._n_ws
         self._env_date: Optional[date] = None
+        self._workspace_signature: Optional[tuple[Workspace, ...]] = None
 
     def invalidate(self, ws_index: int) -> None:
         self._dirty[ws_index] = True
@@ -398,6 +407,18 @@ class BaseGridCache:
             raise ValueError(
                 "workspace count does not match cache construction"
             )
+        signature = tuple(workspaces)
+        if (
+            self._workspace_signature is None
+            or any(
+                previous is not current
+                for previous, current in zip(
+                    self._workspace_signature, signature
+                )
+            )
+        ):
+            self.invalidate_all()
+            self._workspace_signature = signature
         if env_date != self._env_date:
             self.invalidate_all()
             self._env_date = env_date
