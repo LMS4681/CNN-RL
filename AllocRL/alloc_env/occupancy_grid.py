@@ -21,10 +21,6 @@ BASE_CHANNELS = 2
 CANDIDATE_CONTEXT_CHANNELS = 2
 MAX_REMAINING_DAYS = 60
 
-# Temporary B4 compatibility constant. B5 removes the legacy three-channel API.
-NUM_CHANNELS = 3
-
-
 @dataclass(frozen=True)
 class CandidatePlacement:
     position: Optional[Tuple[float, float]]
@@ -299,62 +295,6 @@ class OccupancyGridRenderer:
         if length <= 0 or breadth <= 0:
             raise ValueError("rectangle length and breadth must be positive")
 
-    # Temporary B4 compatibility methods. B5 switches alloc_env.py to the
-    # four-channel APIs above and removes these adapters.
-    def render(
-        self,
-        ws: Workspace,
-        env_date: date,
-        max_remaining_days: int = MAX_REMAINING_DAYS,
-    ) -> np.ndarray:
-        del max_remaining_days
-        base = self.render_base(ws, env_date)
-        workspace_mask = np.ones(
-            (1, self.grid_size, self.grid_size), dtype=np.float32
-        )
-        return np.concatenate([base, workspace_mask], axis=0)
-
-    def render_all(
-        self,
-        workspaces: List[Workspace],
-        env_date: date,
-        max_remaining_days: int = MAX_REMAINING_DAYS,
-    ) -> np.ndarray:
-        return np.stack(
-            [
-                self.render(ws, env_date, max_remaining_days)
-                for ws in workspaces
-            ],
-            axis=0,
-        )
-
-    def render_candidate_mask(
-        self,
-        ws: Workspace,
-        candidate: CandidatePlacement,
-    ) -> np.ndarray:
-        mask = np.zeros(
-            (1, self.grid_size, self.grid_size), dtype=np.float32
-        )
-        if candidate.position is None:
-            return mask
-        center_x, center_y = candidate.position
-        self._render_rectangle(
-            mask[0],
-            ws,
-            center_x,
-            center_y,
-            candidate.length + 2 * SAFETY_DISTANCE,
-            candidate.breadth + 2 * SAFETY_DISTANCE,
-            value=1.0,
-        )
-        return mask
-
-    def compute_scale_value(self, ws: Workspace) -> float:
-        self.coordinate_map(ws)
-        return max(ws.length, ws.breadth) / self.grid_size
-
-
 class BaseGridCache:
     def __init__(self, renderer: OccupancyGridRenderer, n_workspaces: int):
         if (
@@ -422,30 +362,3 @@ class BaseGridCache:
         if env_date != self._env_date:
             self.invalidate_all()
             self._env_date = env_date
-
-    def get_grids(
-        self,
-        workspaces: List[Workspace],
-        env_date: date,
-    ) -> np.ndarray:
-        self._prepare_refresh(workspaces, env_date)
-        for index, workspace in enumerate(workspaces):
-            if self._dirty[index]:
-                self._cache[index] = self._renderer.render(
-                    workspace, env_date
-                )[:BASE_CHANNELS]
-                self._dirty[index] = False
-        workspace_masks = np.ones(
-            (
-                self._n_ws,
-                1,
-                self._renderer.grid_size,
-                self._renderer.grid_size,
-            ),
-            dtype=np.float32,
-        )
-        return np.concatenate([self._cache.copy(), workspace_masks], axis=1)
-
-
-# Temporary compatibility alias for alloc_env.py during B4.
-GridCache = BaseGridCache

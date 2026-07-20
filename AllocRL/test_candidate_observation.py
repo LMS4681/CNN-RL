@@ -264,7 +264,7 @@ class CandidateObservationTests(unittest.TestCase):
         obs, _ = env.reset(seed=3)
 
         self.assertEqual(0.0, float(obs["grids"][0, 3].sum()))
-        self.assertEqual(0.0, float(obs["ws_meta"][0, 2]))
+        self.assertEqual(0.0, float(obs["ws_meta"][0, 3]))
 
     def test_candidate_contract_has_only_original_dimensions(self):
         env = make_env(block_length=20.0, block_breadth=10.0)

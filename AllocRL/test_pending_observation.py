@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from alloc_env import calendar as cal
-from alloc_env.block import Block
+from alloc_env.alloc_env import BlockPlacementEnv
+from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
 from alloc_env.observation_state import (
     ObservationScales,
@@ -75,6 +76,38 @@ def make_observation_fixture(block_count: int = 40) -> dict:
         "env_date": simulator.env_date,
         "scales": make_scales(),
     }
+
+
+EXPECTED_SCHEMA3_SHAPES = {
+    "block": (8,),
+    "future_blocks": (16, 6),
+    "future_demand": (3, 4),
+    "future_mask": (16,),
+    "grids": (10, 4, 64, 64),
+    "pending_blocks": (10, 32, 7),
+    "pending_mask": (10, 32),
+    "pending_summary": (10, 4),
+    "ws_meta": (10, 4),
+}
+
+
+def make_ten_workspace_env(
+    state_context_mode: str = "full",
+    *,
+    observation_scales: ObservationScales | None = None,
+    n_future_blocks: int | None = None,
+) -> BlockPlacementEnv:
+    fixture = make_observation_fixture(block_count=40)
+    return BlockPlacementEnv(
+        fixture["blocks"],
+        fixture["workspaces"],
+        BaseGridStrategy(step=1.0),
+        use_synthetic=False,
+        grid_size=64,
+        state_context_mode=state_context_mode,
+        observation_scales=observation_scales,
+        n_future_blocks=n_future_blocks,
+    )
 
 
 def build_structured_state(fixture: dict) -> dict[str, np.ndarray]:
@@ -218,6 +251,127 @@ class PendingAssignmentIndicesTests(unittest.TestCase):
         simulator.assignments[0] = 1
 
         self.assertEqual(simulator.pending_assignment_indices(99), [])
+
+
+def assert_schema3_observation(env, observation):
+    assert list(observation) == list(env.observation_space.spaces)
+    assert {
+        key: value.shape for key, value in observation.items()
+    } == EXPECTED_SCHEMA3_SHAPES
+    assert all(value.dtype == np.float32 for value in observation.values())
+    assert env.observation_space.contains(observation)
+
+
+def test_reset_step_and_terminal_observations_match_schema3():
+    env = make_ten_workspace_env()
+
+    reset_observation, _ = env.reset(seed=0)
+    step_observation, _, terminated, _, _ = env.step(0)
+    terminal_observation = env.unwrapped._get_terminal_obs()
+
+    assert not terminated
+    assert_schema3_observation(env, reset_observation)
+    assert_schema3_observation(env, step_observation)
+    assert_schema3_observation(env, terminal_observation)
+
+
+def test_current_mode_zeros_only_structured_context():
+    full_env = make_ten_workspace_env(state_context_mode="full")
+    current_env = make_ten_workspace_env(state_context_mode="current")
+    full_observation, _ = full_env.reset(seed=0)
+    current_observation, _ = current_env.reset(seed=0)
+
+    for key in (
+        "future_blocks",
+        "future_mask",
+        "future_demand",
+        "pending_blocks",
+        "pending_mask",
+        "pending_summary",
+    ):
+        assert np.count_nonzero(current_observation[key]) == 0
+    for key in ("block", "grids", "ws_meta"):
+        np.testing.assert_array_equal(current_observation[key], full_observation[key])
+    assert_schema3_observation(current_env, current_observation)
+
+
+@pytest.mark.parametrize("mode", ["future", None, []])
+def test_constructor_rejects_invalid_state_context_mode(mode):
+    with pytest.raises(ValueError, match="state_context_mode"):
+        make_ten_workspace_env(state_context_mode=mode)
+
+
+def test_constructor_rejects_environment_without_workspaces():
+    fixture = make_observation_fixture(block_count=2)
+
+    with pytest.raises(ValueError, match="workspace"):
+        BlockPlacementEnv(fixture["blocks"], [], grid_size=64)
+
+
+def test_constructor_rejects_non_scale_observation_scales():
+    with pytest.raises(TypeError, match="ObservationScales"):
+        make_ten_workspace_env(observation_scales={})
+
+
+@pytest.mark.parametrize(
+    ("scales", "message"),
+    [
+        (make_scales(max_workspace_length=99.0), "workspace.*scale"),
+        (make_scales(dropout_threshold=6), "dropout_threshold"),
+    ],
+)
+def test_constructor_rejects_incompatible_workspace_scales(scales, message):
+    with pytest.raises(ValueError, match=message):
+        make_ten_workspace_env(observation_scales=scales)
+
+
+def test_legacy_n_future_blocks_keyword_does_not_change_schema_or_content():
+    default_env = make_ten_workspace_env()
+    legacy_env = make_ten_workspace_env(n_future_blocks=1)
+
+    default_observation, _ = default_env.reset(seed=0)
+    legacy_observation, _ = legacy_env.reset(seed=0)
+
+    assert list(default_observation) == list(legacy_observation)
+    for key in default_observation:
+        np.testing.assert_array_equal(
+            legacy_observation[key], default_observation[key]
+        )
+
+
+def test_delayed_assignment_changes_pending_state_without_observation_mutation():
+    fixture = make_observation_fixture(block_count=3)
+    fixture["workspaces"][0].add_pre_placement(
+        PrePlacedBlock(
+            label="FULL",
+            pos_x=50.0,
+            pos_y=25.0,
+            length=100.0,
+            breadth=50.0,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+    )
+    env = BlockPlacementEnv(
+        fixture["blocks"],
+        fixture["workspaces"],
+        BaseGridStrategy(step=1.0),
+        grid_size=64,
+    )
+    before, _ = env.reset(seed=0)
+
+    after, _, terminated, _, _ = env.step(0)
+
+    assert not terminated
+    assert not np.array_equal(after["pending_blocks"], before["pending_blocks"])
+    assert not np.array_equal(after["pending_mask"], before["pending_mask"])
+    assert not np.array_equal(after["pending_summary"], before["pending_summary"])
+    np.testing.assert_array_equal(after["grids"][1], before["grids"][1])
+    current = env._placement_simulator.current_block
+    current_state = vars(current).copy()
+    repeated = env._get_obs()
+    assert vars(current) == current_state
+    np.testing.assert_array_equal(repeated["grids"][1], after["grids"][1])
 
 
 def test_schema3_observation_space_has_complete_exact_contract():

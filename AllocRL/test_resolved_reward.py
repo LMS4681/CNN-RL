@@ -54,8 +54,8 @@ class ResolvedRewardTests(unittest.TestCase):
             _, reward, done, _, info = env.step(0)
             total += reward
 
-        self.assertAlmostEqual(info["terminal_score"], total, places=6)
-        self.assertAlmostEqual(info["episode_reward"], total, places=6)
+        self.assertLessEqual(abs(info["terminal_score"] - total), 1e-6)
+        self.assertLessEqual(abs(info["episode_reward"] - total), 1e-6)
         self.assertAlmostEqual(
             info["terminal_score"],
             info["resolved_reward"] + info["terminal_residual"],

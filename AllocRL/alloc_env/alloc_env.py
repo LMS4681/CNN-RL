@@ -1,31 +1,11 @@
-"""
-블록 배치 강화학습 Gymnasium 환경 (CNN 관측 버전).
-
-- Action:  Discrete(num_workspaces) - 현재 블록을 어느 작업장에 배정
-- Obs:     Dict {
-              "block":         블록 속성 + 시간 + 스케일 정보,
-              "grids":         작업장별 4채널 후보 점유 그리드 (N, 4, G, G),
-              "ws_meta":       작업장별 메타데이터 (N, 3),
-              # 아래는 n_future_blocks > 0일 때만 추가되는 미래 lookahead:
-              "future_blocks": 다음 k개 블록 피처 (k, FUTURE_BLOCK_FEATURE_DIM),
-              "future_mask":   미래 블록 유효 마스크 (k,), 1=유효/0=패딩,
-           }
-- Reward:  Resolved block outcomes + terminal conservation residual
-- Mask:    하드 제약 위반 작업장 마스킹 (sb3-contrib MaskablePPO 호환)
-
-CNN 관측 핵심:
-  - 4채널: 점유 / 잔여 출고 공기 / 작업장 경계 / 현재 블록 후보
-  - 비율 유지 리사이즈: 모든 작업장이 128×128 그리드에 수용
-  - 그리드 캐싱: 변경된 작업장만 재렌더링
-  - 작업장 레이아웃 합성: 매 에피소드마다 크기 변형
-"""
+"""Gymnasium environment exposing the fixed schema-3 allocation state."""
 
 from __future__ import annotations
 
 import gymnasium as gym
 import numpy as np
 from datetime import date
-from gymnasium import spaces
+from numbers import Integral
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .block import Block
@@ -41,19 +21,25 @@ from .incremental_simulator import (
 from .simulator import SimulationResult
 from .strategy import BaseGridStrategy
 from .occupancy_grid import (
+    BaseGridCache,
     CandidatePlacement,
-    GridCache,
     GRID_SIZE,
     OccupancyGridRenderer,
+)
+from .observation_state import (
+    ORDERED_FUTURE_COUNT,
+    ObservationScales,
+    build_observation_scales,
+    build_observation_space,
+    encode_current_block,
+    encode_future_blocks,
+    encode_future_demand,
+    encode_pending_queues,
 )
 
 # C# AllocConst 대응
 DELAY_THRESHOLD = 2       # 준수(compliance) 기준: 지연 <= 2일
 DROPOUT_THRESHOLD = 7     # 탈락(dropout) 기준: 지연 > 7일
-
-# 미래 블록 lookahead 관측 (n_future_blocks > 0일 때만 obs에 포함).
-# 각 미래 블록당 피처 차원. _future_block_features 참고.
-FUTURE_BLOCK_FEATURE_DIM = 8
 
 # ── Reward 설정 ──────────────────────────────────────────────────
 REWARD_COMPLIANT = 1.0     # 준수(지연 <= 2일)
@@ -68,26 +54,7 @@ SYNTHETIC_SPREAD_MAX_RATIO = 1.2
 
 
 class BlockPlacementEnv(gym.Env):
-    """
-    블록 배치 강화학습 환경 (CNN 관측 버전).
-
-    에이전트는 각 블록을 하나씩 순차적으로 받고,
-    4채널 후보 점유 그리드를 통해 작업장 공간 상태를 인식한 후
-    어느 작업장에 배정할지 결정합니다.
-
-    Reward:
-      - 전체 블록 배정 완료 후 시뮬레이션 실행
-      - 블록별 준수(+1) / 지연(비례 감점) / 탈락(-2)
-      - 합산 후 블록 수로 정규화 → [-2.0, +1.0]
-      - 중간 단계는 즉시 배치 가능성 및 simulator potential delta로 shaping
-
-    Observation: Dict
-      "block"  : (10,)           - 블록 물리 속성 5 + 시간 3 + 진행률 + 블록 스케일
-      "grids"  : (N, 4, 128, 128) - 작업장별 4채널 후보 점유 그리드
-      "ws_meta": (N, 3)          - 작업장별 (scale, occupancy_ratio, placeable_now)
-
-    use_synthetic=True일 때 매 에피소드마다 랜덤 블록 + 레이아웃 변형.
-    """
+    """Sequential block-allocation environment with fixed schema-3 state."""
 
     metadata = {"render_modes": []}
 
@@ -103,7 +70,9 @@ class BlockPlacementEnv(gym.Env):
         synthetic_n_preplaced: int = 0,
         vary_layout: bool = True,
         grid_size: int = GRID_SIZE,
-        n_future_blocks: int = 0,
+        state_context_mode: str = "full",
+        observation_scales: ObservationScales | None = None,
+        n_future_blocks: Optional[int] = None,
     ):
         super().__init__()
 
@@ -111,8 +80,28 @@ class BlockPlacementEnv(gym.Env):
         self._original_workspaces = workspaces
         self._strategy = strategy or BaseGridStrategy()
 
-        # 미래 블록 lookahead 관측 개수 (0이면 관측에 포함하지 않음 → 기존 계약 유지)
-        self._n_future_blocks = max(int(n_future_blocks), 0)
+        if (
+            isinstance(grid_size, bool)
+            or not isinstance(grid_size, Integral)
+            or grid_size < 1
+        ):
+            raise ValueError("grid_size must be a positive integer")
+        if (
+            not isinstance(state_context_mode, str)
+            or state_context_mode not in {"full", "current"}
+        ):
+            raise ValueError(
+                "state_context_mode must be 'full' or 'current'"
+            )
+        if observation_scales is not None and not isinstance(
+            observation_scales, ObservationScales
+        ):
+            raise TypeError("observation_scales must be an ObservationScales")
+        # Temporary B5 compatibility only. B7 removes this keyword from callers.
+        del n_future_blocks
+        self._state_context_mode = state_context_mode
+        if not workspaces:
+            raise ValueError("at least one workspace is required")
 
         # ── Synthetic 설정 ────────────────────────────────────────
         self._use_synthetic = use_synthetic
@@ -154,45 +143,23 @@ class BlockPlacementEnv(gym.Env):
             )
 
         # ── 점유 그리드 렌더러 + 캐시 ─────────────────────────────
-        self._grid_size = grid_size
+        self._grid_size = int(grid_size)
         self._renderer = OccupancyGridRenderer(grid_size)
-        self._grid_cache = GridCache(self._renderer, self._num_workspaces)
+        self._grid_cache = BaseGridCache(self._renderer, self._num_workspaces)
 
         # ── Action Space ──────────────────────────────────────────
-        self.action_space = spaces.Discrete(self._num_workspaces)
+        self.action_space = gym.spaces.Discrete(self._num_workspaces)
 
         # ── Observation Space (Dict) ──────────────────────────────
-        N = self._num_workspaces
-        G = self._grid_size
-        obs_spaces = {
-            "block": spaces.Box(
-                low=0.0, high=1.0, shape=(10,), dtype=np.float32
-            ),
-            "grids": spaces.Box(
-                low=0.0, high=1.0,
-                shape=(N, 4, G, G), dtype=np.float32
-            ),
-            "ws_meta": spaces.Box(
-                low=0.0, high=1.0,
-                shape=(N, 3), dtype=np.float32
-            ),
-        }
-        # 미래 블록 lookahead: 옵트인. n_future_blocks=0이면 키를 추가하지 않아
-        # 기존 관측 계약({block, grids, ws_meta})을 그대로 유지한다.
-        if self._n_future_blocks > 0:
-            obs_spaces["future_blocks"] = spaces.Box(
-                low=0.0, high=1.0,
-                shape=(self._n_future_blocks, FUTURE_BLOCK_FEATURE_DIM),
-                dtype=np.float32,
-            )
-            obs_spaces["future_mask"] = spaces.Box(
-                low=0.0, high=1.0,
-                shape=(self._n_future_blocks,), dtype=np.float32,
-            )
-        self.observation_space = spaces.Dict(obs_spaces)
-
+        self.observation_space = build_observation_space(
+            self._num_workspaces, self._grid_size
+        )
         # ── 정규화 상수 ───────────────────────────────────────────
-        self._init_norm_constants()
+        self._observation_scales = (
+            observation_scales or self._build_fixture_observation_scales()
+        )
+        self._validate_observation_scales(self._observation_scales)
+        self._base_date = self._observation_scales.base_date
         self._update_ws_areas()
 
         # ── 에피소드 상태 ─────────────────────────────────────────
@@ -234,67 +201,68 @@ class BlockPlacementEnv(gym.Env):
     def _get_infeasible_blocks(self) -> List[int]:
         return self._picker.get_infeasible_blocks()
 
-    def _init_norm_constants(self):
-        """
-        블록 속성·시간 정규화 상수를 '고정값'으로 1회 계산합니다.
+    def _build_fixture_observation_scales(self) -> ObservationScales:
+        try:
+            return build_observation_scales(
+                self._original_blocks,
+                self._original_workspaces,
+                DROPOUT_THRESHOLD,
+                require_full_source=False,
+            )
+        except ValueError as error:
+            if "date_span_workdays must be positive" not in str(error):
+                raise
 
-        synthetic 모드에서 매 에피소드 max(...)를 재계산하면, 동일한 물리
-        블록이 에피소드마다 다른 정규화 값을 갖게 되어(관측 semantics 드리프트)
-        정책·가치 함수 학습이 불안정해집니다. 따라서 안정적인 기준
-        (생성기 분포 상한 또는 원본 블록 최댓값)에서 상수를 한 번만 구합니다.
-        """
-        gen = self._generator
-        if self._use_synthetic and gen is not None:
-            dist = gen.dist
-            self._max_length  = max(float(dist.length.high), 1.0)
-            self._max_breadth = max(float(dist.breadth.high), 1.0)
-            self._max_height  = max(float(dist.height.high), 1.0)
-            self._max_weight  = max(float(dist.weight.high), 1.0)
-            source_blocks = getattr(gen, "source_blocks", ())
-            if source_blocks:
-                self._max_duration = max(
-                    max(block.original_duration for block in source_blocks),
-                    1,
-                )
-                self._base_date = min(
-                    block.in_date for block in source_blocks
-                )
-                self._date_spread = max(
-                    (
-                        max(block.in_date for block in source_blocks)
-                        - self._base_date
-                    ).days,
-                    1,
-                )
-            else:
-                # Parametric generation converts calendar duration to an
-                # approximate working-day duration with a 0.7 factor.
-                self._max_duration = max(
-                    int(dist.duration_days.high * 0.7), 1
-                )
-                self._base_date = self._synthetic_base_date
-                self._date_spread = max(
-                    self._synthetic_spread_range[1], 1
-                )
-        else:
-            blocks = self._original_blocks
-            self._max_length  = max((b.length  for b in blocks), default=1.0) or 1.0
-            self._max_breadth = max((b.breadth for b in blocks), default=1.0) or 1.0
-            self._max_height  = max((b.height  for b in blocks), default=1.0) or 1.0
-            self._max_weight  = max((b.weight  for b in blocks), default=1.0) or 1.0
-            self._max_duration = max(
-                (b.original_duration for b in blocks), default=1
-            ) or 1
+        blocks = self._original_blocks
+        workspaces = self._original_workspaces
+        if not blocks or not workspaces:
+            raise ValueError(
+                "fixture observation scales require blocks and workspaces"
+            )
+        workspace_areas = [ws.length * ws.breadth for ws in workspaces]
+        return ObservationScales(
+            max_length=max(block.length for block in blocks),
+            max_breadth=max(block.breadth for block in blocks),
+            max_duration=max(block.original_duration for block in blocks),
+            base_date=min(block.in_date for block in blocks),
+            date_span_workdays=1,
+            max_workspace_area=max(workspace_areas),
+            total_workspace_area=sum(workspace_areas),
+            max_workspace_length=max(ws.length for ws in workspaces),
+            max_workspace_breadth=max(ws.breadth for ws in workspaces),
+            dropout_threshold=DROPOUT_THRESHOLD,
+        )
 
-            # 입고일 분산 범위 (긴급도 정규화에 사용)
-            if blocks:
-                min_in = min(b.in_date for b in blocks)
-                max_in = max(b.in_date for b in blocks)
-                self._base_date = min_in
-                self._date_spread = max((max_in - min_in).days, 1)
-            else:
-                self._base_date = date(2026, 4, 1)
-                self._date_spread = 1
+    def _validate_observation_scales(self, scales: ObservationScales) -> None:
+        if scales.dropout_threshold != DROPOUT_THRESHOLD:
+            raise ValueError(
+                "observation scales dropout_threshold does not match environment"
+            )
+        workspace_areas = []
+        for workspace in self._original_workspaces:
+            if (
+                not np.isfinite(workspace.length)
+                or not np.isfinite(workspace.breadth)
+                or workspace.length <= 0
+                or workspace.breadth <= 0
+            ):
+                raise ValueError(
+                    "workspace geometry must be finite and positive"
+                )
+            workspace_areas.append(workspace.length * workspace.breadth)
+        scale_mismatch = (
+            any(
+                workspace.length > scales.max_workspace_length
+                or workspace.breadth > scales.max_workspace_breadth
+                for workspace in self._original_workspaces
+            )
+            or any(area > scales.max_workspace_area for area in workspace_areas)
+            or sum(workspace_areas) > scales.total_workspace_area
+        )
+        if scale_mismatch:
+            raise ValueError(
+                "workspace geometry exceeds observation scale bounds"
+            )
 
     def _update_ws_areas(self):
         """작업장 면적 및 스케일 정보 갱신."""
@@ -303,14 +271,6 @@ class BlockPlacementEnv(gym.Env):
             dtype=np.float32,
         )
         self._ws_areas = np.maximum(self._ws_areas, 1.0)
-
-        # 스케일 정보 (1px당 미터, 정규화용)
-        scales = np.array(
-            [self._renderer.compute_scale_value(ws) for ws in self._workspaces],
-            dtype=np.float32,
-        )
-        self._max_scale = max(scales.max(), 1e-6)
-        self._ws_scales = scales / self._max_scale  # 정규화 [0, 1]
 
     # ── 작업장 재빌드 ─────────────────────────────────────────────
 
@@ -547,7 +507,7 @@ class BlockPlacementEnv(gym.Env):
         if self._placement_simulator is None:
             return []
         return self._placement_simulator.upcoming_block_indices(
-            self._n_future_blocks
+            ORDERED_FUTURE_COUNT
         )
 
     def future_workspace_choice_count(
@@ -735,172 +695,116 @@ class BlockPlacementEnv(gym.Env):
             )
         return candidates
 
-    def _future_block_features(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        다음 k개 pending 블록의 피처와 유효 마스크 (미래 lookahead 관측).
-
-        반환:
-          features (k, FUTURE_BLOCK_FEATURE_DIM):
-            [0] 길이 / max_length
-            [1] 폭 / max_breadth
-            [2] 높이 / max_height
-            [3] 중량 / max_weight
-            [4] 공기(근무일) / max_duration
-            [5] 도착 임박도: (in_date - 현재 env_date) / date_spread, [0,1] 클립
-                (0 = 지금 도착 대기, 1 = 먼 미래)
-            [6] 종횡비 (min/max)
-            [7] 면적 스케일 (블록 면적 / 최대 작업장 면적)
-          mask (k,): 유효 슬롯 1.0, 패딩 슬롯 0.0.
-
-        블록 정규화 상수는 현재 블록 피처와 동일하게 사용해 의미를 일치시킨다.
-        패딩(남은 블록 < k) 슬롯은 0으로 채운다.
-        """
-        k = self._n_future_blocks
-        features = np.zeros((k, FUTURE_BLOCK_FEATURE_DIM), dtype=np.float32)
-        mask = np.zeros(k, dtype=np.float32)
-        if k == 0 or self._placement_simulator is None:
-            return features, mask
-
-        upcoming = self._placement_simulator.upcoming_block_indices(k)
-        max_ws_area = float(self._ws_areas.max())
-        for slot, idx in enumerate(upcoming):
-            blk = self._blocks[idx]
-            features[slot] = (
-                blk.length / self._max_length,
-                blk.breadth / self._max_breadth,
-                blk.height / self._max_height,
-                blk.weight / self._max_weight,
-                blk.original_duration / self._max_duration,
-                np.clip(
-                    (blk.in_date - self._env_date).days / self._date_spread,
-                    0.0, 1.0,
-                ),
-                min(blk.length, blk.breadth)
-                / max(blk.length, blk.breadth, 1e-6),
-                np.clip(
-                    (blk.length * blk.breadth) / max_ws_area, 0.0, 1.0
-                ),
-            )
-            mask[slot] = 1.0
-        return features, mask
-
     def _get_obs(self) -> Dict[str, np.ndarray]:
-        """
-        Dict 관측 구성.
-
-        "block" (10,):
-          [0]  길이 / max_length         블록 물리 속성
-          [1]  폭 / max_breadth
-          [2]  높이 / max_height
-          [3]  중량 / max_weight
-          [4]  공기(근무일) / max_duration
-          [5]  입고 긴급도               시간/진행 정보
-          [6]  블록 종횡비 (min/max)      형상 정보 (회전 적합성)
-          [7]  진행률
-          [8]  현재 블록 면적 스케일      (블록 면적 / 최대 작업장 면적)
-          [9]  현재 블록 최대 축 비율     (max(L,B) / 최대 작업장 축)
-
-        "grids" (N, 4, 128, 128):
-          Ch0: 블록 점유 마스크
-          Ch1: 잔여 출고 공기 (정규화)
-          Ch2: 작업장 경계 마스크
-          Ch3: 현재 블록의 후보 배치 마스크
-
-        "ws_meta" (N, 3):
-          [0] scale (1px당 m, 정규화)
-          [1] occupancy_ratio (면적 점유율)
-          [2] placeable_now (현재 env_date에 즉시 배치 가능하면 1, 아니면 0)
-        """
         if self._current_block_index is None:
             return self._get_terminal_obs()
 
-        blk = self._blocks[self._current_block_index]
+        simulator = self._placement_simulator
+        if simulator is None or simulator.current_block is None:
+            return self._get_terminal_obs()
+        block = simulator.current_block
+        block_features = encode_current_block(
+            block,
+            self._env_date,
+            simulator.assigned_count,
+            self._observation_scales,
+        )
 
-        # ── Block features (10,) ──────────────────────────────────
-        block_features = np.array([
-            blk.length / self._max_length,
-            blk.breadth / self._max_breadth,
-            blk.height / self._max_height,
-            blk.weight / self._max_weight,
-            blk.original_duration / self._max_duration,
-            # 입고 긴급도: 기준일에 가까울수록 0 (급함)
-            np.clip(
-                (blk.in_date - self._base_date).days / self._date_spread,
-                0.0, 1.0
-            ),
-            # 블록 종횡비 (min/max) — 정사각(≈1)인지 길쭉한지, 회전 적합성 판단
-            min(blk.length, blk.breadth) / max(blk.length, blk.breadth, 1e-6),
-            # 진행률
-            self._current_step / max(self._num_blocks - 1, 1),
-            # 블록 면적 스케일 (최대 작업장 대비)
-            np.clip(
-                (blk.length * blk.breadth) / self._ws_areas.max(),
-                0.0, 1.0
-            ),
-            # 블록 최대 축 비율
-            np.clip(
-                max(blk.length, blk.breadth)
-                / max(
-                    max(ws.length for ws in self._workspaces),
-                    max(ws.breadth for ws in self._workspaces),
-                    1.0
-                ),
-                0.0, 1.0
-            ),
-        ], dtype=np.float32)
-
-        # ── Workspace grids (N, 4, 128, 128) ─────────────────────
-        base_grids = self._grid_cache.get_grids(
+        base_grids = self._grid_cache.get_base_grids(
             self._workspaces, self._env_date
         )
-        self._candidate_placements = self._compute_candidate_placements(blk)
-        candidate_masks = np.stack([
-            self._renderer.render_candidate_mask(workspace, candidate)
+        self._candidate_placements = self._compute_candidate_placements(block)
+        candidate_context = np.stack([
+            self._renderer.render_candidate_context(
+                workspace, candidate, block, self._env_date
+            )
             for workspace, candidate in zip(
                 self._workspaces, self._candidate_placements
             )
         ])
-        grids = np.concatenate([base_grids, candidate_masks], axis=1)
+        grids = np.concatenate([base_grids, candidate_context], axis=1)
 
-        # ── Workspace meta (N, 3) ────────────────────────────────
-        occupancy = np.clip(
+        workspace_lengths = np.array(
+            [workspace.length for workspace in self._workspaces],
+            dtype=np.float32,
+        )
+        workspace_breadths = np.array(
+            [workspace.breadth for workspace in self._workspaces],
+            dtype=np.float32,
+        )
+        placed_area_ratio = np.clip(
             self._ws_used_area / self._ws_areas, 0.0, 1.0
         )
         placeable = np.array(
             [candidate.placeable for candidate in self._candidate_placements],
             dtype=np.float32,
         )
-        ws_meta = np.stack([self._ws_scales, occupancy, placeable], axis=1)
+        ws_meta = np.stack([
+            np.clip(
+                workspace_lengths
+                / self._observation_scales.max_workspace_length,
+                0.0,
+                1.0,
+            ),
+            np.clip(
+                workspace_breadths
+                / self._observation_scales.max_workspace_breadth,
+                0.0,
+                1.0,
+            ),
+            placed_area_ratio,
+            placeable,
+        ], axis=1).astype(np.float32)
 
-        obs = {
+        future_indices = simulator.unassigned_block_indices()
+        future_blocks, future_mask = encode_future_blocks(
+            self._blocks,
+            future_indices,
+            self._env_date,
+            self._observation_scales,
+        )
+        future_demand = encode_future_demand(
+            self._blocks,
+            future_indices,
+            self._env_date,
+            self._observation_scales,
+        )
+        pending_blocks, pending_mask, pending_summary = encode_pending_queues(
+            self._blocks,
+            self._workspaces,
+            simulator,
+            self._observation_scales,
+        )
+        if self._state_context_mode == "current":
+            future_blocks = np.zeros_like(future_blocks)
+            future_mask = np.zeros_like(future_mask)
+            future_demand = np.zeros_like(future_demand)
+            pending_blocks = np.zeros_like(pending_blocks)
+            pending_mask = np.zeros_like(pending_mask)
+            pending_summary = np.zeros_like(pending_summary)
+
+        arrays = {
             "block": block_features,
             "grids": grids,
-            "ws_meta": ws_meta.astype(np.float32),
+            "ws_meta": ws_meta,
+            "future_blocks": future_blocks,
+            "future_mask": future_mask,
+            "future_demand": future_demand,
+            "pending_blocks": pending_blocks,
+            "pending_mask": pending_mask,
+            "pending_summary": pending_summary,
         }
-        if self._n_future_blocks > 0:
-            future_blocks, future_mask = self._future_block_features()
-            obs["future_blocks"] = future_blocks
-            obs["future_mask"] = future_mask
-        return obs
+        return {
+            key: arrays[key]
+            for key in self.observation_space.spaces
+        }
 
     def _get_terminal_obs(self) -> Dict[str, np.ndarray]:
-        """에피소드 종료 시 더미 관측."""
-        N = self._num_workspaces
-        G = self._grid_size
-        obs = {
-            "block": np.zeros(10, dtype=np.float32),
-            "grids": np.zeros((N, 4, G, G), dtype=np.float32),
-            "ws_meta": np.zeros((N, 3), dtype=np.float32),
+        """Return a schema-3 zero observation after the episode ends."""
+        return {
+            key: np.zeros(space.shape, dtype=space.dtype)
+            for key, space in self.observation_space.spaces.items()
         }
-        if self._n_future_blocks > 0:
-            obs["future_blocks"] = np.zeros(
-                (self._n_future_blocks, FUTURE_BLOCK_FEATURE_DIM),
-                dtype=np.float32,
-            )
-            obs["future_mask"] = np.zeros(
-                self._n_future_blocks, dtype=np.float32
-            )
-        return obs
 
     def _get_info(self) -> Dict[str, Any]:
         return {

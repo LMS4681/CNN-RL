@@ -179,7 +179,7 @@ class RlRegressionTests(unittest.TestCase):
         self.assertEqual(0.5, obs["block"][0])
 
     def test_ws_meta_exposes_placeability_column(self):
-        # B2: ws_meta는 (N, 3) = [scale, occupancy_ratio, placeable_now].
+        # Schema 3: [length, breadth, placed-area ratio, placeability].
         blocks = [
             make_block("A001", date(2026, 1, 5)),
             make_block("A002", date(2026, 1, 6)),
@@ -192,12 +192,12 @@ class RlRegressionTests(unittest.TestCase):
         )
         obs, _ = env.reset()
 
-        self.assertEqual(obs["ws_meta"].shape, (1, 3))
-        placeable = obs["ws_meta"][:, 2]
+        self.assertEqual(obs["ws_meta"].shape, (1, 4))
+        placeable = obs["ws_meta"][:, 3]
         # 이진 신호(0/1)여야 한다.
         self.assertTrue(bool(((placeable == 0.0) | (placeable == 1.0)).all()))
         # 빈 100x100 작업장에 10x10 블록은 즉시 배치 가능 → 1.
-        self.assertEqual(obs["ws_meta"][0, 2], 1.0)
+        self.assertEqual(obs["ws_meta"][0, 3], 1.0)
 
     def test_synthetic_env_uses_csv_like_spread_range(self):
         blocks = [
@@ -223,6 +223,7 @@ class RlRegressionTests(unittest.TestCase):
             synthetic_n_blocks=len(blocks),
             grid_size=32,
         )
+        fixed_scales = env._observation_scales
         env.reset()
 
         csv_spread = (blocks[1].in_date - blocks[0].in_date).days
@@ -231,7 +232,7 @@ class RlRegressionTests(unittest.TestCase):
             max(30, int(round(csv_spread * 1.2))),
         )
         self.assertEqual(expected, captured["spread_days"])
-        self.assertEqual(expected[1], env._date_spread)
+        self.assertIs(fixed_scales, env._observation_scales)
 
     def test_filtered_workspaces_define_action_and_observation_shape(self):
         ws_a = make_workspace()
@@ -248,7 +249,7 @@ class RlRegressionTests(unittest.TestCase):
         obs, _ = env.reset()
 
         self.assertEqual((1, 4, 32, 32), obs["grids"].shape)
-        self.assertEqual((1, 3), obs["ws_meta"].shape)
+        self.assertEqual((1, 4), obs["ws_meta"].shape)
         self.assertEqual([True], env.action_masks().tolist())
         self.assertGreater(float(obs["grids"][0].sum()), 0.0)
 
@@ -309,23 +310,24 @@ class RlRegressionTests(unittest.TestCase):
 
         env.reset()
         render_calls = []
-        original_render = env._renderer.render
+        original_render_base = env._renderer.render_base
 
-        def counting_render(ws, env_date, max_remaining_days=60):
+        def counting_render_base(ws, env_date):
             render_calls.append(ws.code)
-            return original_render(ws, env_date, max_remaining_days)
+            return original_render_base(ws, env_date)
 
-        env._renderer.render = counting_render
+        env._renderer.render_base = counting_render_base
 
         obs, _, terminated, _, _ = env.step(0)
 
         self.assertFalse(terminated)
         self.assertEqual(date(2026, 1, 5), env._env_date)
         self.assertEqual(["PE001"], render_calls)
-        expected_grids = np.stack([
-            original_render(ws, env._env_date) for ws in env._workspaces
+        expected_base_grids = np.stack([
+            original_render_base(ws, env._env_date) for ws in env._workspaces
         ], axis=0)
-        np.testing.assert_array_equal(obs["grids"][:, :3], expected_grids)
+        np.testing.assert_array_equal(obs["grids"][:, :2], expected_base_grids)
+        self.assertGreater(float(obs["grids"][:, 2].sum()), 0.0)
         self.assertGreater(float(obs["grids"][:, 3].sum()), 0.0)
 
     def test_step_moves_observation_date_to_next_block(self):
